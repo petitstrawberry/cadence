@@ -1,5 +1,5 @@
 //! Output adapters are created and owned on the playback worker.
-//! A drop discards pending audio; EOF drains before dropping the adapter.
+//! A drop discards pending audio; only the playlist end drains and drops the adapter.
 pub type Result<T> = std::result::Result<T, String>;
 pub type Frame = [f32; 2];
 

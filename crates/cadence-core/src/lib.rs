@@ -1,8 +1,10 @@
 //! Portable, streaming playback and transport for Cadence.
 //!
-//! File I/O, decoding and device ownership live on one worker. UI commands use a
+//! Playback and device ownership live on one worker; a bounded decoder worker
+//! prepares the next track for continuous output. UI commands use a
 //! bounded, nonblocking channel; audio callbacks never acquire the UI snapshot lock.
 pub mod decoder;
+mod gapless;
 pub mod output;
 mod player;
 

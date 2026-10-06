@@ -319,7 +319,7 @@ impl Cadence {
                 Spacer::new(),
             }.spacing(12.).frame(width, (body_height - PLAYER_CLEARANCE).max(0.)))
         } else {
-            AnyView::new(ListView::new(self.playback.queue.tracks.clone(), self.playback.queue.selected.clone(), 52., move |index, track, selected| {
+            AnyView::new(ListView::new(self.playback.queue.tracks.clone(), self.playback.queue.selected.clone(), 52., move |index, track, _selected| {
                 let choose = app.clone();
                 let remove = app.clone();
                 let active = app.playback.queue.current.get() == Some(index);
@@ -341,7 +341,7 @@ impl Cadence {
                     Button::icon_only(Icon::X).header_style().icon_size(IconSize::Small)
                         .on_click(move || remove.send(Command::Remove(index))).frame(28.,28.),
                 }.spacing(12.).padding_insets(EdgeInsets::horizontal(PAGE_PADDING)).frame(width,52.)
-                    .background(if selected == Some(index) || active { selected_color() } else { ColorPalette::default().background() })
+                    .background(if active { selected_color() } else { ColorPalette::default().background() })
             }).content_bottom_inset(PLAYER_CLEARANCE).frame(width,body_height))
         };
         let clear_action = if count == 0 {

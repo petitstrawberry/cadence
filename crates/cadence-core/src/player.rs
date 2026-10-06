@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::gapless::{Prefetcher, Prepared};
+
 use crate::{
     AudioDecoder, AudioOutput, DecoderRegistry, Frame, MediaInput, OutputFactory, Resampler, Result,
 };
@@ -155,6 +157,7 @@ pub struct Player {
 struct InputControl {
     generation: u64,
     active: Option<Arc<AtomicBool>>,
+    prefetch: Option<Arc<AtomicBool>>,
     queued_tracks: usize,
     queued_current: Option<usize>,
     queued_repeat: RepeatMode,
@@ -169,7 +172,7 @@ struct QueuedCommand {
 
 impl InputControl {
     fn cancel(&self) {
-        if let Some(active) = &self.active {
+        for active in [&self.active, &self.prefetch].into_iter().flatten() {
             active.store(true, Ordering::Release);
         }
     }
@@ -435,6 +438,12 @@ impl Drop for Player {
     }
 }
 
+struct Boundary {
+    at: u64,
+    index: usize,
+    seekable: bool,
+}
+
 struct Session {
     decoder: Box<dyn AudioDecoder>,
     output: Option<Box<dyn AudioOutput>>,
@@ -442,6 +451,12 @@ struct Session {
     output_rate: u32,
     base: Duration,
     accepted: u64,
+    played: u64,
+    audible_start: u64,
+    decode_start: u64,
+    decode_base: Duration,
+    decoding_index: usize,
+    boundaries: VecDeque<Boundary>,
     pending: Vec<Frame>,
     submitted: VecDeque<Frame>,
     offset: usize,
@@ -452,14 +467,18 @@ struct Session {
 }
 
 impl Session {
-    fn position(&self) -> Duration {
+    fn cursor(&self) -> u64 {
         let pending = self
             .output
             .as_ref()
             .map_or(0, |output| output.pending_frames()) as u64;
+        self.played + self.accepted.saturating_sub(pending)
+    }
+
+    fn position(&self) -> Duration {
         self.base
             + Duration::from_secs_f64(
-                self.accepted.saturating_sub(pending) as f64 / self.output_rate as f64,
+                self.cursor().saturating_sub(self.audible_start) as f64 / self.output_rate as f64,
             )
     }
 
@@ -468,6 +487,11 @@ impl Session {
         self.output.take();
         self.base = self.decoder.seek(position)?;
         self.accepted = 0;
+        self.played = 0;
+        self.audible_start = 0;
+        self.decode_start = 0;
+        self.decode_base = self.base;
+        self.boundaries.clear();
         self.pending.clear();
         self.submitted.clear();
         self.offset = 0;
@@ -490,7 +514,7 @@ impl Session {
             return Err(format!("Unsupported input sample rate: {input_rate} Hz"));
         }
         if rate != self.output_rate {
-            if !self.pending.is_empty() || !self.base.is_zero() {
+            if !self.pending.is_empty() || !self.base.is_zero() || self.played != 0 {
                 return Err("Output sample rate changed while playback was paused".into());
             }
             self.resampler = Resampler::new(input_rate, rate)?;
@@ -507,9 +531,7 @@ impl Session {
             .as_ref()
             .map_or(0, |output| output.pending_frames())
             .min(self.submitted.len());
-        self.base += Duration::from_secs_f64(
-            self.accepted.saturating_sub(waiting as u64) as f64 / f64::from(self.output_rate),
-        );
+        self.played += self.accepted.saturating_sub(waiting as u64);
         self.accepted = 0;
         self.output.take();
         // Only the device's bounded unconsumed tail is retained. This preserves
@@ -527,7 +549,8 @@ impl Session {
 
 struct Worker {
     output: OutputFactory,
-    registry: DecoderRegistry,
+    registry: Arc<DecoderRegistry>,
+    prefetcher: Prefetcher,
     processors: Vec<Box<dyn AudioProcessor>>,
     data: Snapshot,
     shared: Arc<Mutex<Snapshot>>,
@@ -550,8 +573,10 @@ impl Worker {
         shared: Arc<Mutex<Snapshot>>,
         input_control: Arc<Mutex<InputControl>>,
     ) -> Self {
+        let registry = Arc::new(registry);
         Self {
             output,
+            prefetcher: Prefetcher::new(registry.clone()),
             registry,
             processors,
             data: Snapshot::default(),
@@ -612,6 +637,7 @@ impl Worker {
     }
 
     fn publish(&mut self, force: bool) {
+        self.update_audible();
         // Keep the generation check and snapshot commit indivisible with send's
         // cancellation. No decoder or device I/O occurs while this lock is held.
         let control = self
@@ -650,6 +676,7 @@ impl Worker {
     }
 
     fn fail(&mut self, error: String) {
+        self.prefetcher.cancel();
         if let Some(session) = &self.session {
             self.data.position = session.position();
         }
@@ -666,6 +693,7 @@ impl Worker {
     }
 
     fn load(&mut self, index: usize, play: bool) -> Result<()> {
+        self.prefetcher.cancel();
         let Some(track) = self.data.queue.get(index) else {
             return Err("Track is no longer in the queue".into());
         };
@@ -720,6 +748,12 @@ impl Worker {
             output_rate: rate,
             base: Duration::ZERO,
             accepted: 0,
+            played: 0,
+            audible_start: 0,
+            decode_start: 0,
+            decode_base: Duration::ZERO,
+            decoding_index: index,
+            boundaries: VecDeque::new(),
             pending: Vec::new(),
             submitted: VecDeque::new(),
             offset: 0,
@@ -770,15 +804,19 @@ impl Worker {
     }
 
     fn seek(&mut self, position: Duration) -> Result<()> {
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| !session.decoder.is_seekable())
-        {
+        self.prefetcher.cancel();
+        if self.session.is_some() && !self.data.seekable {
             self.data.error = Some("This source does not support seeking".into());
             return Ok(());
         }
         let play = self.data.state == PlaybackState::Playing;
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| Some(session.decoding_index) != self.data.current)
+        {
+            self.load(self.data.current.unwrap(), false)?;
+        }
         if self.session.is_none() {
             let Some(index) = self.data.current else {
                 return Ok(());
@@ -809,6 +847,7 @@ impl Worker {
     }
 
     fn stop(&mut self, retain_position: bool) {
+        self.prefetcher.cancel();
         if retain_position {
             if let Some(session) = &self.session {
                 self.data.position = session.position();
@@ -893,6 +932,7 @@ impl Worker {
     }
 
     fn queued_command(&mut self, queued: QueuedCommand) {
+        self.update_audible();
         self.generation = queued.generation;
         self.sequence = queued.sequence;
         self.command(queued.command);
@@ -967,6 +1007,48 @@ impl Worker {
     }
 
     fn handle(&mut self, command: Command) -> Result<()> {
+        let buffered_wrap = self.data.repeat == RepeatMode::All
+            && self.session.as_ref().is_some_and(|session| {
+                session
+                    .boundaries
+                    .iter()
+                    .any(|boundary| boundary.index == 0)
+            });
+        let affects_successor = match &command {
+            Command::Add(paths) => {
+                buffered_wrap
+                    && !paths.is_empty()
+                    && self.data.queue.len() + paths.len() <= MAX_QUEUE_TRACKS
+            }
+            Command::AddTracks(tracks) => {
+                buffered_wrap
+                    && !tracks.is_empty()
+                    && self.data.queue.len() + tracks.len() <= MAX_QUEUE_TRACKS
+            }
+            Command::Remove(index) => *index < self.data.queue.len(),
+            Command::SetRepeat(mode) => *mode != self.data.repeat,
+            _ => false,
+        };
+        if affects_successor {
+            self.prefetcher.cancel();
+            // Already submitted successors must be discarded when their queue
+            // order changes. Ordinary pause preserves them sample for sample.
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.boundaries.is_empty())
+            {
+                let position = self.session.as_ref().unwrap().position();
+                let playing = self.data.state == PlaybackState::Playing;
+                self.load(self.data.current.unwrap(), false)?;
+                if self.data.seekable {
+                    self.seek(position)?;
+                }
+                if playing {
+                    self.play()?;
+                }
+            }
+        }
         match command {
             Command::Add(paths) => {
                 return self.handle(Command::AddTracks(
@@ -1035,6 +1117,9 @@ impl Worker {
                     && index < current
                 {
                     self.data.current = Some(current - 1);
+                    if let Some(session) = &mut self.session {
+                        session.decoding_index -= 1;
+                    }
                 }
             }
             Command::Clear => {
@@ -1050,6 +1135,131 @@ impl Worker {
         Ok(())
     }
 
+    fn successor(&self) -> Option<usize> {
+        let index = self.session.as_ref()?.decoding_index;
+        if self.data.repeat == RepeatMode::One {
+            Some(index)
+        } else if index + 1 < self.data.queue.len() {
+            Some(index + 1)
+        } else if self.data.repeat == RepeatMode::All && !self.data.queue.is_empty() {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_prefetch(&mut self) -> Result<()> {
+        let Some(index) = self.successor() else {
+            self.prefetcher.cancel();
+            return Ok(());
+        };
+        // Bound even a playlist containing sub-millisecond tracks.
+        if self.session.as_ref().unwrap().boundaries.len() >= 64 {
+            return Ok(());
+        }
+        if let Some(cancelled) = self.prefetcher.request(
+            index,
+            &self.data.queue[index],
+            self.session.as_ref().unwrap().output_rate,
+        )? {
+            let mut control = self.input_control.lock().unwrap_or_else(|p| p.into_inner());
+            if control.generation != self.generation {
+                cancelled.store(true, Ordering::Release);
+                return Err("Playback request was superseded".into());
+            }
+            control.prefetch = Some(cancelled);
+        }
+        Ok(())
+    }
+
+    fn update_audible(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let cursor = session.cursor();
+        let mut control = self.input_control.lock().unwrap_or_else(|p| p.into_inner());
+        if control.generation != self.generation || control.sequence != self.sequence {
+            return;
+        }
+        while session
+            .boundaries
+            .front()
+            .is_some_and(|boundary| cursor >= boundary.at)
+        {
+            let boundary = session.boundaries.pop_front().unwrap();
+            session.audible_start = boundary.at;
+            session.base = Duration::ZERO;
+            self.data.current = Some(boundary.index);
+            self.data.duration = self.data.queue[boundary.index].duration;
+            self.data.seekable = boundary.seekable;
+            control.queued_current = Some(boundary.index);
+        }
+    }
+
+    fn continue_gapless(&mut self, index: usize, prepared: Prepared) -> Result<bool> {
+        let mut control = self.input_control.lock().unwrap_or_else(|p| p.into_inner());
+        if control.generation != self.generation {
+            prepared.cancelled.store(true, Ordering::Release);
+            return Err("Playback request was superseded".into());
+        }
+        if control.sequence != self.sequence {
+            drop(control);
+            self.prefetcher.restore(prepared);
+            return Ok(false);
+        }
+        if let Some(previous) = control.active.replace(prepared.cancelled.clone()) {
+            previous.store(true, Ordering::Release);
+        }
+        control.prefetch = None;
+        self.input_cancelled = Some(prepared.cancelled);
+        drop(control);
+        self.prefetcher.finish();
+        let metadata = prepared.decoder.metadata();
+        let input_rate = metadata.sample_rate;
+        if !(1000..=384_000).contains(&input_rate) {
+            return Err(format!("Unsupported input sample rate: {input_rate} Hz"));
+        }
+        let track = &mut self.data.queue[index];
+        let fallback = Track::from_path(track.path.clone()).title;
+        if metadata.title != fallback || track.title.is_empty() {
+            track.title.clone_from(&metadata.title);
+        }
+        if metadata.artist.is_some() {
+            track.artist.clone_from(&metadata.artist);
+        }
+        if metadata.album.is_some() {
+            track.album.clone_from(&metadata.album);
+        }
+        track.duration = metadata.duration.or(track.duration);
+        self.revision += 1;
+        let session = self.session.as_mut().unwrap();
+        let at = session.played + session.accepted;
+        session.boundaries.push_back(Boundary {
+            at,
+            index,
+            seekable: prepared.decoder.is_seekable(),
+        });
+        session.decoder = prepared.decoder;
+        session.decoding_index = index;
+        session.decode_start = at;
+        session.decode_base = Duration::ZERO;
+        session.resampler = Resampler::new(input_rate, session.output_rate)?;
+        session.pending = session.resampler.process(&prepared.first, false);
+        session.offset = 0;
+        session.eof = false;
+        session.draining = false;
+        // Preserve CLAP state across the boundary; only the input resampler has
+        // a new source clock. No output drop, drain, silence or processor reset.
+        for processor in &mut self.processors {
+            processor.prepare(session.output_rate, OUTPUT_BLOCK)?;
+            for block in session.pending.chunks_mut(OUTPUT_BLOCK) {
+                processor.process(block, session.output_rate)?;
+            }
+        }
+        self.update_audible();
+        Ok(true)
+    }
+
     fn tick(&mut self) -> Result<bool> {
         if self.obsolete() {
             return Ok(false);
@@ -1060,6 +1270,8 @@ impl Worker {
         if self.data.state != PlaybackState::Playing {
             return Ok(false);
         }
+        self.update_audible();
+        self.ensure_prefetch()?;
         let session = self.session.as_mut().unwrap();
         let output = session.output.as_mut().unwrap();
         output.check_error()?;
@@ -1068,7 +1280,12 @@ impl Worker {
             session.last_progress = Instant::now();
         }
         session.last_device_pending = device_pending;
-        if session.last_progress.elapsed() > STALL_TIMEOUT {
+        if session.last_progress.elapsed() > STALL_TIMEOUT
+            && (device_pending != 0
+                || session.offset < session.pending.len()
+                || !session.eof
+                || session.draining)
+        {
             return Err("Audio output stopped consuming samples".into());
         }
 
@@ -1098,16 +1315,65 @@ impl Worker {
             return Ok(accepted > 0);
         }
         if session.eof {
+            if session.played + session.accepted == session.decode_start
+                && session.decode_base.is_zero()
+            {
+                return Err("Track contains no decodable audio".into());
+            }
+            if let Some(next) = self.successor() {
+                // Do not choose a successor ahead of already accepted commands.
+                let control = self.input_control.lock().unwrap_or_else(|p| p.into_inner());
+                if control.sequence != self.sequence {
+                    return Ok(false);
+                }
+                drop(control);
+                match self.prefetcher.take_ready(next) {
+                    Some(Ok(prepared)) => {
+                        if self.session.as_ref().unwrap().draining {
+                            // A track appended after the playlist tail started
+                            // draining cannot be written to that SAS stream.
+                            if self
+                                .session
+                                .as_ref()
+                                .unwrap()
+                                .output
+                                .as_ref()
+                                .unwrap()
+                                .is_drained()
+                            {
+                                self.prefetcher.finish();
+                                drop(prepared);
+                                self.advance(true)?;
+                                return Ok(true);
+                            }
+                            self.prefetcher.restore(prepared);
+                            return Ok(false);
+                        }
+                        return self.continue_gapless(next, prepared);
+                    }
+                    Some(Err(error)) => {
+                        let session = self.session.as_mut().unwrap();
+                        let output = session.output.as_mut().unwrap();
+                        if !session.draining {
+                            output.begin_drain()?;
+                            session.draining = true;
+                        }
+                        if output.is_drained() {
+                            return Err(error);
+                        }
+                        return Ok(false);
+                    }
+                    None => return Ok(false),
+                }
+            }
+            let session = self.session.as_mut().unwrap();
+            let output = session.output.as_mut().unwrap();
             if !session.draining {
                 output.begin_drain()?;
                 session.draining = true;
             }
             if output.is_drained() {
-                // An empty/corrupt source must never form a repeat retry loop.
-                if session.accepted == 0 && session.base.is_zero() {
-                    return Err("Track contains no decodable audio".into());
-                }
-                self.advance(true)?;
+                self.stop(true);
                 return Ok(true);
             }
             return Ok(false);
@@ -1752,15 +2018,446 @@ mod tests {
         player.send(Command::Add(vec![track.0.clone()])).unwrap();
         player.send(Command::SetRepeat(RepeatMode::One)).unwrap();
         player.send(Command::Play).unwrap();
-        wait(&player, |_| device.drains.load(Ordering::Acquire) == 1);
-        device.pending.store(0, Ordering::Release);
-        wait(&player, |_| device.created.load(Ordering::Acquire) == 2);
+        wait(&player, |_| device.pending.load(Ordering::Acquire) == 512);
+        assert_eq!(device.drains.load(Ordering::Acquire), 0);
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.written.lock().unwrap().len(), 512);
         device.fail.store(true, Ordering::Release);
         let failed = wait(&player, |snapshot| snapshot.state == PlaybackState::Error);
         assert!(failed.error.unwrap().contains("Injected"));
         thread::sleep(Duration::from_millis(50));
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.dropped.load(Ordering::Acquire), 1);
+        player.shutdown();
+    }
+
+    fn patterned_wav(rate: u32, count: usize, seed: i16) -> Fixture {
+        let fixture = wav(0);
+        let mut writer = hound::WavWriter::create(
+            &fixture.0,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for index in 0..count {
+            let sample = seed + (index % 997) as i16;
+            writer.write_sample(sample).unwrap();
+            writer.write_sample(-sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        fixture
+    }
+
+    fn expected_pcm(track: &Fixture) -> Vec<Frame> {
+        let mut decoder = DecoderRegistry::default().open(&track.0).unwrap();
+        let mut resampler = Resampler::new(decoder.metadata().sample_rate, 8000).unwrap();
+        let mut result = Vec::new();
+        loop {
+            let block = decoder.read_frames(2048).unwrap();
+            result.extend(resampler.process(&block, block.is_empty()));
+            if block.is_empty() {
+                return result;
+            }
+        }
+    }
+
+    fn fill_device(worker: &mut Worker, device: &DeviceState) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while device.pending.load(Ordering::Acquire) < 512
+            && worker.data.state == PlaybackState::Playing
+        {
+            worker.tick().unwrap();
+            if worker
+                .session
+                .as_ref()
+                .is_some_and(|session| session.draining)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prefetch did not fill the output"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.publish(true);
+    }
+
+    #[test]
+    fn gapless_pcm_is_exact_across_rates_and_pause_at_a_buffered_boundary() {
+        struct Processor(Arc<AtomicUsize>);
+        impl AudioProcessor for Processor {
+            fn process(&mut self, _: &mut [Frame], _: u32) -> Result<()> {
+                Ok(())
+            }
+            fn reset(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let files = [
+            patterned_wav(8000, 251, 1000),
+            patterned_wav(16000, 806, 5000),
+            patterned_wav(11025, 777, 9000),
+        ];
+        let expected_tracks: Vec<_> = files.iter().map(expected_pcm).collect();
+        let expected: Vec<_> = expected_tracks.iter().flatten().copied().collect();
+        for (pause, append) in [(false, false), (true, false), (false, true)] {
+            let device = Arc::new(DeviceState::default());
+            let resets = Arc::new(AtomicUsize::new(0));
+            let mut worker = Worker::new(
+                factory(&device),
+                DecoderRegistry::default(),
+                vec![Box::new(Processor(resets.clone()))],
+                Arc::new(Mutex::new(Snapshot::default())),
+                Arc::new(Mutex::new(InputControl::default())),
+            );
+            worker.data.volume = 1.;
+            worker
+                .handle(Command::Add(
+                    files
+                        .iter()
+                        .take(if append { 2 } else { 3 })
+                        .map(|f| f.0.clone())
+                        .collect(),
+                ))
+                .unwrap();
+            worker.handle(Command::Play).unwrap();
+            fill_device(&mut worker, &device);
+            assert_eq!(
+                worker.data.current,
+                Some(0),
+                "prefetch must not select the next track early"
+            );
+            assert!(!worker.session.as_ref().unwrap().boundaries.is_empty());
+            if append {
+                worker
+                    .handle(Command::Add(vec![files[2].0.clone()]))
+                    .unwrap();
+                assert_eq!(
+                    device.created.load(Ordering::Acquire),
+                    1,
+                    "append interrupted buffered audio"
+                );
+            }
+            let mut consumed = Vec::new();
+            let mut read = 0;
+            let mut paused = false;
+            while worker.data.state == PlaybackState::Playing {
+                let count = device.pending.load(Ordering::Acquire).min(128);
+                assert!(count > 0, "output underflow before the playlist ended");
+                consumed.extend_from_slice(&device.written.lock().unwrap()[read..read + count]);
+                read += count;
+                device.pending.fetch_sub(count, Ordering::Release);
+                worker.publish(true);
+                let mut start = 0;
+                let index = expected_tracks
+                    .iter()
+                    .position(|frames| {
+                        start += frames.len();
+                        consumed.len() < start
+                    })
+                    .unwrap_or(expected_tracks.len() - 1);
+                assert_eq!(
+                    worker.data.current,
+                    Some(index),
+                    "highlight is not at the consumed boundary"
+                );
+                if pause && !paused {
+                    let position = worker.data.position;
+                    worker.handle(Command::Pause).unwrap();
+                    worker.publish(true);
+                    assert_eq!(worker.data.position, position);
+                    read = device.written.lock().unwrap().len(); // the old unconsumed device tail was discarded
+                    worker.handle(Command::Play).unwrap();
+                    paused = true;
+                }
+                fill_device(&mut worker, &device);
+            }
+            assert_eq!(
+                consumed, expected,
+                "inserted, dropped or duplicated PCM at a boundary"
+            );
+            assert_eq!(
+                device.created.load(Ordering::Acquire),
+                if pause { 2 } else { 1 }
+            );
+            assert_eq!(
+                device.dropped.load(Ordering::Acquire),
+                if pause { 2 } else { 1 }
+            );
+            assert_eq!(
+                device.drains.load(Ordering::Acquire),
+                1,
+                "only the playlist tail may drain"
+            );
+            assert_eq!(
+                resets.load(Ordering::Acquire),
+                1,
+                "CLAP state was reset between tracks"
+            );
+            assert_eq!(worker.data.current, Some(2));
+        }
+    }
+
+    #[test]
+    fn gapless_repeat_all_wraps_without_reopening_output() {
+        let files = [
+            patterned_wav(8000, 251, 1000),
+            patterned_wav(16000, 806, 5000),
+        ];
+        let cycle: Vec<_> = files.iter().flat_map(expected_pcm).collect();
+        let device = Arc::new(DeviceState::default());
+        let mut worker = Worker::new(
+            factory(&device),
+            DecoderRegistry::default(),
+            vec![],
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(Mutex::new(InputControl::default())),
+        );
+        worker.data.volume = 1.;
+        worker.data.repeat = RepeatMode::All;
+        worker
+            .handle(Command::Add(files.iter().map(|f| f.0.clone()).collect()))
+            .unwrap();
+        worker.handle(Command::Play).unwrap();
+        let mut consumed = Vec::new();
+        let mut read = 0;
+        for _ in 0..12 {
+            fill_device(&mut worker, &device);
+            consumed.extend_from_slice(&device.written.lock().unwrap()[read..read + 128]);
+            read += 128;
+            device.pending.fetch_sub(128, Ordering::Release);
+        }
+        assert_eq!(
+            consumed,
+            cycle
+                .iter()
+                .cycle()
+                .take(consumed.len())
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.drains.load(Ordering::Acquire), 0);
+        worker.handle(Command::Clear).unwrap();
+        assert_eq!(device.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn seek_and_queue_edits_discard_prefetched_successors_without_stale_audio() {
+        let files = [
+            patterned_wav(8000, 251, 1000),
+            patterned_wav(8000, 800, 5000),
+        ];
+        let first_pcm = expected_pcm(&files[0]);
+        for remove in [false, true] {
+            let device = Arc::new(DeviceState::default());
+            let mut worker = Worker::new(
+                factory(&device),
+                DecoderRegistry::default(),
+                vec![],
+                Arc::new(Mutex::new(Snapshot::default())),
+                Arc::new(Mutex::new(InputControl::default())),
+            );
+            worker.data.volume = 1.;
+            worker
+                .handle(Command::Add(files.iter().map(|f| f.0.clone()).collect()))
+                .unwrap();
+            worker.handle(Command::Play).unwrap();
+            fill_device(&mut worker, &device);
+            assert_eq!(worker.data.current, Some(0));
+            assert_eq!(worker.session.as_ref().unwrap().decoding_index, 1);
+            worker.handle(Command::Remove(999)).unwrap();
+            worker.handle(Command::AddTracks(Vec::new())).unwrap();
+            assert_eq!(
+                device.created.load(Ordering::Acquire),
+                1,
+                "no-op edit restarted playback"
+            );
+            let written = device.written.lock().unwrap().len();
+            if remove {
+                worker.handle(Command::Remove(1)).unwrap();
+            } else {
+                worker
+                    .handle(Command::Seek(Duration::from_micros(12500)))
+                    .unwrap();
+            }
+            fill_device(&mut worker, &device);
+            assert_eq!(worker.data.current, Some(0));
+            let after = device.written.lock().unwrap();
+            assert_eq!(
+                after[written],
+                first_pcm[if remove { 0 } else { 100 }],
+                "seek used the decoder of the buffered next track"
+            );
+            if remove {
+                assert_eq!(after.len() - written, first_pcm.len());
+            }
+            assert_eq!(device.created.load(Ordering::Acquire), 2);
+            assert_eq!(device.drains.load(Ordering::Acquire), usize::from(remove));
+        }
+    }
+
+    #[test]
+    fn failed_prefetch_preserves_the_current_tail_and_reports_once() {
+        let track = wav(800);
+        let device = Arc::new(DeviceState::default());
+        device.hold_tail.store(true, Ordering::Release);
+        let player = Player::new(factory(&device)).unwrap();
+        player
+            .send(Command::ReplaceTracksAndPlay(vec![
+                Track::from_path(track.0.clone()),
+                Track::from_path(track.0.with_extension("missing")),
+            ]))
+            .unwrap();
+        wait(&player, |_| device.pending.load(Ordering::Acquire) == 512);
+        device.pending.store(0, Ordering::Release);
+        wait(&player, |_| device.drains.load(Ordering::Acquire) == 1);
+        assert_eq!(device.pending.load(Ordering::Acquire), 288);
+        device.pending.store(0, Ordering::Release);
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(player.snapshot().state, PlaybackState::Playing);
+        device.hold_tail.store(false, Ordering::Release);
+        let failed = wait(&player, |snapshot| snapshot.state == PlaybackState::Error);
+        assert!(failed.error.unwrap().contains("Unable to open"));
+        assert_eq!(device.written.lock().unwrap().len(), 800);
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.dropped.load(Ordering::Acquire), 1);
+        assert_eq!(device.drains.load(Ordering::Acquire), 1);
+        player.shutdown();
+    }
+
+    #[test]
+    fn a_command_accepted_during_gapless_handoff_defers_without_losing_pcm() {
+        let files = [
+            patterned_wav(8000, 251, 1000),
+            patterned_wav(8000, 800, 5000),
+        ];
+        let device = Arc::new(DeviceState::default());
+        let control = Arc::new(Mutex::new(InputControl::default()));
+        let mut worker = Worker::new(
+            factory(&device),
+            DecoderRegistry::default(),
+            vec![],
+            Arc::new(Mutex::new(Snapshot::default())),
+            control.clone(),
+        );
+        worker
+            .handle(Command::Add(files.iter().map(|f| f.0.clone()).collect()))
+            .unwrap();
+        worker.handle(Command::Play).unwrap();
+        // Decode, submit, then recognize current EOF, before the handoff tick.
+        for _ in 0..3 {
+            worker.tick().unwrap();
+        }
+        assert!(worker.session.as_ref().unwrap().eof);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let prepared = loop {
+            if let Some(result) = worker.prefetcher.take_ready(1) {
+                break result.unwrap();
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        control.lock().unwrap().sequence = 1;
+        assert!(!worker.continue_gapless(1, prepared).unwrap());
+        assert_eq!(worker.session.as_ref().unwrap().decoding_index, 0);
+        worker.sequence = 1; // the queued command has now been handled
+        assert!(worker.tick().unwrap());
+        assert_eq!(worker.session.as_ref().unwrap().decoding_index, 1);
+        assert_eq!(worker.data.current, Some(0));
+        assert_eq!(device.pending.load(Ordering::Acquire), 251);
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.drains.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn waiting_for_a_slow_source_is_not_reported_as_a_stalled_device() {
+        let current = wav(251);
+        let entered = Arc::new(AtomicBool::new(false));
+        let next = blocked_stream(PathBuf::from("slow-next.wav"), entered.clone());
+        let device = Arc::new(DeviceState::default());
+        let mut worker = Worker::new(
+            factory(&device),
+            DecoderRegistry::default(),
+            vec![],
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(Mutex::new(InputControl::default())),
+        );
+        worker
+            .handle(Command::AddTracksAndPlay(vec![
+                Track::from_path(current.0.clone()),
+                next,
+            ]))
+            .unwrap();
+        for _ in 0..3 {
+            worker.tick().unwrap();
+        }
+        assert!(worker.session.as_ref().unwrap().eof);
+        device.pending.store(0, Ordering::Release);
+        let session = worker.session.as_mut().unwrap();
+        session.last_device_pending = 0;
+        session.last_progress = Instant::now() - STALL_TIMEOUT - Duration::from_secs(1);
+        assert!(!worker.tick().unwrap());
+        assert_eq!(worker.data.state, PlaybackState::Playing);
+        worker.handle(Command::Clear).unwrap();
+    }
+
+    #[test]
+    fn append_after_terminal_drain_waits_for_the_tail_before_reopening() {
+        let first = wav(251);
+        let second = wav(16000);
+        let device = Arc::new(DeviceState::default());
+        device.hold_tail.store(true, Ordering::Release);
+        let player = Player::new(factory(&device)).unwrap();
+        player
+            .send(Command::AddTracksAndPlay(vec![Track::from_path(
+                first.0.clone(),
+            )]))
+            .unwrap();
+        wait(&player, |_| device.drains.load(Ordering::Acquire) == 1);
+        player.send(Command::Add(vec![second.0.clone()])).unwrap();
+        wait(&player, |snapshot| snapshot.queue.len() == 2);
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        device.pending.store(0, Ordering::Release);
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        device.hold_tail.store(false, Ordering::Release);
+        wait(&player, |snapshot| {
+            snapshot.current == Some(1) && device.pending.load(Ordering::Acquire) == 512
+        });
         assert_eq!(device.created.load(Ordering::Acquire), 2);
-        assert_eq!(device.dropped.load(Ordering::Acquire), 2);
+        assert_eq!(device.drains.load(Ordering::Acquire), 1);
+        player.send(Command::Clear).unwrap();
+        wait(&player, |snapshot| snapshot.queue.is_empty());
+        player.shutdown();
+    }
+
+    #[test]
+    fn gapless_prefetch_open_is_cancelled_without_blocking_clear() {
+        let current = wav(16000);
+        let entered = Arc::new(AtomicBool::new(false));
+        let next = blocked_stream(PathBuf::from("next.wav"), entered.clone());
+        let device = Arc::new(DeviceState::default());
+        let player = Player::new(factory(&device)).unwrap();
+        player
+            .send(Command::ReplaceTracksAndPlay(vec![
+                Track::from_path(current.0.clone()),
+                next,
+            ]))
+            .unwrap();
+        wait(&player, |_| {
+            entered.load(Ordering::Acquire) && device.pending.load(Ordering::Acquire) == 512
+        });
+        player.send(Command::Clear).unwrap();
+        let snapshot = wait(&player, |snapshot| snapshot.queue.is_empty());
+        assert_eq!(snapshot.state, PlaybackState::Stopped);
+        assert_eq!(device.created.load(Ordering::Acquire), 1);
+        assert_eq!(device.dropped.load(Ordering::Acquire), 1);
         player.shutdown();
     }
 

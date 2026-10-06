@@ -1,5 +1,33 @@
 # 検証記録
 
+## 2026-10-06 — キューのハイライトとギャップレス再生
+
+- Play queueの色はcurrentのみを参照し、クリック時の選択を併せて着色する条件を撤去。
+  currentの変更時には古いselectedを解除。保持した描画ツリーで0→1→2→0と進め、
+  常に正しい1行だけがハイライトされることを確認しました。
+- 自然な曲送り／Repeat One／Repeat Allは、次曲を別の単一ワーカーで先読みして、
+  同じ音声出力に連続してPCMを送ります。CLAP stateを曲境界でresetせず、
+  current／duration／seekable／positionは出力の未消費フレームと境界位置から更新。
+- 8,000／16,000／11,025 Hzの3曲のPCMが、各曲を出力レートへ変換した期待値と
+  全フレーム完全一致。曲間の無音挿入・欠落・重複なし、出力生成1回、drainは末尾の1回。
+  曲境界のPCMがバッファーにある状態で一時停止／再開しても消費PCMが一致します。
+- Repeat Allの折り返し、Repeat One、シークとキュー編集による先読み破棄、
+  詰まった先読みのキャンセル、次曲の失敗時に現在曲のtailが残ることを検証。
+  曲境界とコマンド受付が重なる場合は先読みPCMを保持して遷移を延期します。
+  ネットワークの待機を出力停止と誤判定せず、terminal drain開始後の追加は旧tail完了後に
+  出力を開き直します（Scarletのdrain済みストリームに追記しません）。
+- Macのrelease Gapless QA版で6／18／18秒の連続440 Hz WAVをキューに追加し、
+  最初の行をクリックしてA→B→Cの自動曲送りを実画面確認。AとBの色が残らず、
+  Now Playingの曲名も再生中の行と一致。音声ループバック計測ではなく、PCM検証と
+  ネイティブ画面の動作確認です。専用データは `/tmp/cadence-gapless-qa-20261006`。
+- release workspaceは実CLAP Gain／ignoredを含む282件成功、format check成功。
+  通常bundleと既存Resize QA bundleを更新。Scarlet AArch64／RISC-V64のreleaseビルドと
+  ELF監査も成功。Scarlet実機のSASでの聴感検証は別途です。
+- encoder delay／padding除去は[Symphonia 0.6.1の形式・コーデック対応](https://docs.rs/symphonia/0.6.1/symphonia/)に依存。
+  AAC／MP4、元ファイル内の無音、ネットワーク供給不足までサンプル単位の境界を保証しません。
+- ログ: `artifacts/kanade-ui-qa/cadence-gapless-{workspace-tests,format-check,bundle,scarlet}.log`、
+  `gapless-live*.log`、`gapless-updated-qa*.log`。
+
 ## 2026-10-06 — トランスポートの中央配置を固定
 
 再生ボタンはフローティングバー全体の中央、前後移動は左右対称。

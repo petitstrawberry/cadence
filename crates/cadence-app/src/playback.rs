@@ -95,6 +95,7 @@ impl Playback {
         }
         if next.current != previous.current {
             self.queue.current.set(next.current);
+            self.queue.selected.set(None);
         }
         if next.error != previous.error {
             self.status

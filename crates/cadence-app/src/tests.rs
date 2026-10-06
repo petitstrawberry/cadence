@@ -2961,3 +2961,59 @@ fn japanese_now_playing_labels_fit_their_column_after_resize() {
         tree.clear_root();
     }
 }
+
+#[test]
+fn automatic_queue_advance_paints_only_the_current_row() {
+    fn highlights(element: &dyn Element, parent: Point, found: &mut Vec<Point>) {
+        let origin = Point::new(
+            parent.x + element.position().x,
+            parent.y + element.position().y,
+        );
+        if let Some(render) = element.render_object()
+            && render
+                .as_any()
+                .is::<scarlet_ui::views::BackgroundRenderObject>()
+        {
+            let mut paint = PaintContext::new();
+            render.paint(&mut paint, origin);
+            if paint.commands().iter().any(|command| {
+                matches!(command,
+                PaintCommand::FillPath { color, .. } if *color == selected_color())
+            }) {
+                found.push(origin);
+            }
+        }
+        for child in element.children() {
+            highlights(child.as_ref(), origin, found);
+        }
+    }
+    let app = app();
+    populate(&app);
+    app.playback.queue.selected.set(Some(0));
+    let mut tree = ElementTree::new();
+    tree.set_root(
+        presentation::QueueFrame {
+            app: app.clone(),
+            width: 900.,
+            height: 650.,
+        }
+        .create_element(),
+    );
+    let mut first_y = None;
+    for index in [0, 1, 2, 0] {
+        // Automatic playback changes current; the old clicked selection may
+        // still be present until presentation polling reconciles it.
+        app.playback.queue.current.set(Some(index));
+        rebuild(&mut tree, Size::new(900., 650.));
+        let mut found = Vec::new();
+        highlights(tree.root().unwrap(), Point::ZERO, &mut found);
+        assert_eq!(
+            found.len(),
+            1,
+            "old selection stayed highlighted: {found:?}"
+        );
+        let y = *first_y.get_or_insert(found[0].y);
+        assert!((found[0].y - y - index as f32 * 52.).abs() <= 0.5);
+    }
+    tree.clear_root();
+}
