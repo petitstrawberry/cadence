@@ -1,0 +1,23 @@
+[package]
+name = "cadence-platform"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cadence-core = { path = "../cadence-core" }
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+cpal = "0.15.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "NSView", "NSResponder", "block2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+block2 = "0.6.2"
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

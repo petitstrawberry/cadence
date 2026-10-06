@@ -1,0 +1,26 @@
+[package]
+name = "cadence-sources"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cadence-core = { path = "../cadence-core" }
+cadence-library = { path = "../cadence-library" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "=2.5.8"
+roxmltree = "=0.20.0"
+sha2 = "=0.10.9"
+ureq = { version = "=2.12.1", default-features = false }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+getrandom = "=0.4.3"
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a" }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[
+  {
+    "item_id": "demo-track-1",
+    "title": "Example track",
+    "artist": "Example artist",
+    "album": "Example album",
+    "media_url": "http://127.0.0.1:8765/example.wav",
+    "artwork_url": "http://127.0.0.1:8765/cover.png"
+  }
+]

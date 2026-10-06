@@ -1,0 +1,12 @@
+# Include after Scarlet's desktop and native SGFX driver bundles.
+# Build std as PIC, audit the executable, and only then stage it.
+[[layers]]
+kind = "script"
+source = "build-{arch}.sh"
+# No output cache: inspect current sources and audit on each image build.
+to = "/bin/cadence"
+
+[[layers]]
+kind = "copy"
+source = "fs"
+to = "/"

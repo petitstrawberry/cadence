@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Called by cargo-scarlet's script layer inside an existing development shell.
+set -euo pipefail
+if [ "$#" -ne 2 ]; then
+  printf 'Usage: %s TARGET OUTPUT_FILE\n' "$0" >&2
+  exit 2
+fi
+target="$1"
+case "$target" in
+  aarch64-unknown-scarlet) architecture=aarch64 ;;
+  riscv64gc-unknown-scarlet) architecture=riscv64 ;;
+  *) printf 'Unsupported Scarlet target: %s\n' "$target" >&2; exit 2 ;;
+esac
+case "$2" in
+  /*) destination="$2" ;;
+  *) destination="$PWD/$2" ;;
+esac
+cd "$(dirname "$0")/../.."
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+bash scripts/verify-scarlet "$target"
+mkdir -p "$(dirname "$destination")"
+temporary="$(mktemp "${destination}.XXXXXX")"
+trap 'rm -f "$temporary"' EXIT
+cp "$CARGO_TARGET_DIR/$target/release/cadence" "$temporary"
+chmod 755 "$temporary"
+# Validate the exact staged bytes, including when the source build was reused.
+python3 scripts/audit-scarlet.py "$temporary" --arch "$architecture"
+mv -f "$temporary" "$destination"

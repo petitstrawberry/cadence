@@ -1,0 +1,13 @@
+[package]
+name = "cadence-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+symphonia = { version = "=0.6.1", default-features = false, features = ["opt-simd", "all-meta", "aac", "aiff", "alac", "caf", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+
+[dev-dependencies]
+hound = "3.5"
+
+[lints]
+workspace = true

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Run through ./scripts/dev, or inside the pinned Nix development shell.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+profile=release
+build_flags=(--locked -p cadence --bin cadence --release)
+case "${1:-}" in
+  "") ;;
+  --release) shift ;;
+  --debug) profile=debug; build_flags=(--locked -p cadence --bin cadence); shift ;;
+  --help|-h)
+    printf 'Usage: ./scripts/dev scripts/bundle-macos [--release|--debug]\n\nBuild a release macOS app in ${CARGO_TARGET_DIR:-target}/macos/Cadence.app.\n'
+    exit 0
+    ;;
+  *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+esac
+if [ "$#" -ne 0 ]; then
+  printf 'Usage: ./scripts/dev scripts/bundle-macos [--release|--debug]\n' >&2
+  exit 2
+fi
+if [ "$(uname -s)" != Darwin ]; then
+  printf 'This script requires a macOS host.\n' >&2
+  exit 1
+fi
+
+target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+mkdir -p "$target_dir/macos"
+target_dir="$(cd "$target_dir" && pwd)"
+staging="$(mktemp -d "$target_dir/macos/.Cadence.app.XXXXXX")"
+trap 'rm -rf "$staging"' EXIT
+
+# Cargo reports the actual executable path, including custom target settings.
+cargo build "${build_flags[@]}" \
+  --message-format=json-render-diagnostics > "$staging/build.json"
+binary="$(python3 - "$staging/build.json" <<'PY'
+import json
+import sys
+
+paths = []
+with open(sys.argv[1], encoding="utf-8") as stream:
+    for line in stream:
+        message = json.loads(line)
+        target = message.get("target", {})
+        if (message.get("reason") == "compiler-artifact"
+                and target.get("name") == "cadence"
+                and "bin" in target.get("kind", [])
+                and message.get("executable")):
+            paths.append(message["executable"])
+if len(paths) != 1:
+    sys.exit("Cargo did not report exactly one Cadence executable")
+print(paths[0])
+PY
+)"
+# Reject an accidental Scarlet/cross build before replacing the local app.
+/usr/bin/lipo "$binary" -verify_arch "$(uname -m)"
+mkdir -p "$staging/Contents/MacOS"
+install -m 755 "$binary" "$staging/Contents/MacOS/cadence"
+cp platforms/macos/Info.plist "$staging/Contents/Info.plist"
+/usr/bin/plutil -lint "$staging/Contents/Info.plist"
+rm "$staging/build.json"
+
+bundle="$target_dir/macos/Cadence.app"
+rm -rf "$bundle"
+mv "$staging" "$bundle"
+printf 'Built %s app: %s\n' "$profile" "$bundle"
+printf 'Open locally with: open "%s"\n' "$bundle"

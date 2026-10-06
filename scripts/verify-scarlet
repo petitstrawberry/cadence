@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Run through ./scripts/dev. Rebuild target stdlibs as PIC for the native PIE.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+if [ "$#" -eq 0 ]; then
+  set -- aarch64-unknown-scarlet riscv64gc-unknown-scarlet
+fi
+for target in "$@"; do
+  case "$target" in
+    aarch64-unknown-scarlet|riscv64gc-unknown-scarlet) ;;
+    *) printf 'Unsupported Scarlet target: %s\n' "$target" >&2; exit 2 ;;
+  esac
+done
+if ! command -v readelf >/dev/null && ! command -v llvm-readelf >/dev/null; then
+  printf 'readelf or llvm-readelf is required for the native ELF audit. Run through ./scripts/dev.\n' >&2
+  exit 127
+fi
+mkdir -p artifacts
+for target in "$@"; do
+  cargo build --locked --release -p cadence --target "$target" \
+    -Z build-std=std,panic_abort \
+    -Z build-std-features=compiler-builtins-mem 2>&1 |
+    tee "artifacts/build-$target.log"
+  case "$target" in
+    aarch64-unknown-scarlet) architecture=aarch64 ;;
+    riscv64gc-unknown-scarlet) architecture=riscv64 ;;
+  esac
+  python3 scripts/audit-scarlet.py \
+    "${CARGO_TARGET_DIR:-$PWD/target}/$target/release/cadence" \
+    --arch "$architecture" --json "artifacts/audit-$target.json"
+done
+printf 'Scarlet builds and ELF audits passed. SWS/SAS runtime and audible output remain separate checks.\n'

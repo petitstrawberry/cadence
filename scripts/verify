@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Run through ./scripts/dev, or inside the pinned Nix development shell.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p artifacts
+cargo-fmt fmt --all -- --check 2>&1 | tee artifacts/format.log
+cargo test --locked --workspace -- --test-threads=1 2>&1 | tee artifacts/tests.log
+cargo build --locked --release -p cadence 2>&1 | tee artifacts/build.log
+printf 'Host format, tests, and build passed. GUI and audible playback require a runtime check.\n'

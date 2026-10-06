@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/cadence-core", "crates/cadence-platform", "crates/cadence-library", "crates/cadence-sources", "crates/cadence-effects", "crates/cadence-app", "vendor/sws-protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
+
+[patch."https://github.com/petitstrawberry/Scarlet"]
+sws-protocol = { path = "vendor/sws-protocol" }
+
+
+[profile.dev]
+debug = 0
+[profile.test]
+debug = 0

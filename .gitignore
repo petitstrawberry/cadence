@@ -1,0 +1,4 @@
+/target/
+/artifacts/
+/.direnv/
+.DS_Store

@@ -1,0 +1,15 @@
+[package]
+name = "cadence-effects"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cadence-core = { path = "../cadence-core" }
+resonara-clap = { git = "https://github.com/petitstrawberry/resonara", rev = "7b17e9f87714d47f572526dbd239282ab4745ce3" }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[lints]
+workspace = true

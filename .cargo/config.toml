@@ -1,0 +1,4 @@
+# Dependencies must also use PIC for Scarlet's resident ELF loader.
+# Executable-only arguments and the link seed live in cadence-app/build.rs.
+[target.'cfg(target_os = "scarlet")']
+rustflags = ["-C", "relocation-model=pic", "--cfg", "getrandom_backend=\"custom\""]

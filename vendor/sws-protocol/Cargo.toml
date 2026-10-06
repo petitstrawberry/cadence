@@ -1,0 +1,16 @@
+[package]
+name = "sws-protocol"
+version = "1.0.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+legacy-scarlet-std = ["dep:scarlet-std"]
+std = []
+
+[dependencies]
+scarlet-std = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", optional = true }
+
+[lib]
+name = "sws_protocol"
+path = "src/lib.rs"

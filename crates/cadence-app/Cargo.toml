@@ -1,0 +1,22 @@
+[package]
+name = "cadence"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cadence-core = { path = "../cadence-core" }
+cadence-platform = { path = "../cadence-platform" }
+cadence-library = { path = "../cadence-library" }
+cadence-sources = { path = "../cadence-sources" }
+cadence-effects = { path = "../cadence-effects" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "86a765daaf26545fc0294aa7054d98630df9e368", default-features = false, features = ["std", "platform-winit"] }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "86a765daaf26545fc0294aa7054d98630df9e368", default-features = false, features = ["std", "platform-sws"] }
+
+[lints]
+workspace = true
