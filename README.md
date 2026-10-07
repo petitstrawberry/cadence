@@ -185,3 +185,23 @@ Scarlet デスクトップイメージが必要です。通常の native SGFX bu
 
 その後 Scarlet 上でファイル追加、再生 / 一時停止、シーク、曲送り、EOF、音量、
 アプリ終了を操作して、画面と出音を確認します。起動・再生エラーは画面下部に表示します。
+
+### Scarlet app directory
+
+`platforms/scarlet/app.toml` is the sole application metadata and recipe; the
+window ID and title are derived from it at build time for catalog launch/focus. With
+an updated local `cargo-scarlet` on PATH, build in the existing development shell:
+
+```sh
+./scripts/dev cargo scarlet app build --source platforms/scarlet \
+  --target aarch64-unknown-scarlet --release --output dist/aarch64/cadence.app
+```
+
+Use `riscv64gc-unknown-scarlet` and a separate output for RISC-V64. The recipe
+retains the PIC std build and audits the exact staged ELF. The existing bundle
+now stages `/applications/cadence.app`, containing `bin/cadence` and the generated
+`org.scarlet-os.cadence.desktop`. No source recipe or second desktop descriptor is
+shipped. stemd discovers it at startup; subsequent changes require explicit
+`ReloadApplications`. SGFX client pins need the updated `/lib/sgfx` discovery
+revision before complete-distribution rollout; GPU/audio and physical-device
+verification remain separate from build/audit checks.

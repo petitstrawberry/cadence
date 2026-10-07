@@ -68,7 +68,8 @@ struct Cadence {
 }
 impl Cadence {
     fn window(&self, size: Size) -> Window<Self> {
-        Window::new("Cadence", self.clone())
+        Window::new(env!("CADENCE_APP_NAME"), self.clone())
+            .app_id(env!("CADENCE_APP_ID"))
             .size(size)
             .min_size(Size::new(737., 600.))
             .background_color(ColorPalette::default().background())
