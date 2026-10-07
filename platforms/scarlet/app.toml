@@ -1,0 +1,13 @@
+# The only editable Cadence application metadata and build recipe.
+[app]
+id = "org.scarlet-os.cadence"
+slug = "cadence"
+name = "Cadence"
+exec = "bin/cadence"
+args = ["%F"]
+icon = "file-music"
+mime-types = ["audio/wav", "audio/x-wav", "audio/flac", "audio/x-flac", "audio/mpeg", "audio/ogg", "audio/vorbis", "audio/mp4", "audio/aac", "audio/x-aiff", "audio/x-caf"]
+
+[build]
+kind = "script"
+source = "install"

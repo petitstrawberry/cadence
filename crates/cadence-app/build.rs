@@ -19,6 +19,25 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
 }
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Match the catalog identity without maintaining another descriptor or ID.
+    let recipe =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
+            .join("../../platforms/scarlet/app.toml");
+    println!("cargo:rerun-if-changed={}", recipe.display());
+    let metadata: toml::Value = toml::from_str(&fs::read_to_string(recipe).expect("read app.toml"))
+        .expect("parse app.toml");
+    for (key, variable) in [("id", "CADENCE_APP_ID"), ("name", "CADENCE_APP_NAME")] {
+        let value = metadata
+            .get("app")
+            .and_then(|app| app.get(key))
+            .and_then(toml::Value::as_str)
+            .expect("app.toml requires app.id and app.name");
+        assert!(
+            !value.is_empty() && !value.chars().any(char::is_control),
+            "invalid app metadata"
+        );
+        println!("cargo:rustc-env={variable}={value}");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("scarlet") {
         return;
     }
