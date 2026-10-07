@@ -17,7 +17,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 block2 = "0.6.2"
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", default-features = false, features = ["std"] }
+sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
