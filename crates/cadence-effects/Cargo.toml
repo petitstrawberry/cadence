@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cadence-core = { path = "../cadence-core" }
-resonara-clap = { git = "https://github.com/petitstrawberry/resonara", rev = "0e5c33acc395ec271dbf106355eaedcb3cd03b73" }
+resonara-clap = { git = "https://github.com/petitstrawberry/resonara", rev = "0e57f579bb9d533ec528fe25c9122803dec9be6a" }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
