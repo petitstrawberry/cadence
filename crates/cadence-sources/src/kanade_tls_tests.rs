@@ -82,8 +82,9 @@ fn client_identity_authenticates_both_https_and_websocket() {
             }
         }
     });
-    assert!(macos::decode_identity(CLIENT, "wrong-fixture-password").is_err());
-    let tls = macos::decode_identity_with_roots(CLIENT, PASSWORD, roots).unwrap();
+    assert!(decode_identity(CLIENT, "wrong-fixture-password").is_err());
+    let identity = decode_identity(CLIENT, PASSWORD).unwrap();
+    let tls = tls_config(&identity, roots).unwrap();
     let transport = Transport {
         tls: Some(Arc::new(tls)),
         identity_origin: Some(Url::parse(&format!("https://{address}")).unwrap()),

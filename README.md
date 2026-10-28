@@ -28,7 +28,8 @@ open target/macos/Cadence.app
 バンドルは既定で release ビルドです。デバッグ用には `--debug` を指定できます。
 
 出力先は
-`${CARGO_TARGET_DIR:-target}/macos/Cadence.app` です。署名・公証を含む配布用パッケージではありません。
+`${CARGO_TARGET_DIR:-target}/macos/Cadence.app` です。ローカル起動用の ad-hoc 署名と検証を行います。
+Developer ID 署名・公証を含む配布用パッケージではありません。
 
 依存する ScarletUI は `86a765daaf26545fc0294aa7054d98630df9e368`、Scarlet の
 SAS / runtime は `b3d2a55740a3d2ca49daad0ec7baba233f706f7a` に Git pin しています。
@@ -110,14 +111,20 @@ PNG / JPEG のカバーに対応し、画像とカタログのサイズには上
   音源・画像の署名 URL は利用時に取得し、再生・一時停止中も接続と heartbeat を維持します。
   シークや次の HTTP Range 要求で署名を再取得するため、長時間の再生・一時停止にも対応します。
   署名 URL やサーバー上のファイルパスはカタログに保存しません。
-  macOS でサーバーがクライアント証明書を要求する場合は **Use KanadeApp client certificate**
-  を選べます。KanadeApp の **TLS / mTLS** で設定済みの証明書を使用し、必要なアクセス承認は
-  ソース画面の **Authorize certificate…** から macOS の確認画面で行います。
-  アプリの起動ごとに明示的な承認操作が必要で、自動同期では Keychain を読み取ったり
-  承認画面を表示したりしません。認証データはプロセスのメモリー内だけで扱い、
-  新しい Keychain 項目・証明書ファイルを作成しません。証明書を送る先は設定した HTTPS origin
-  に限定し、別の origin へのリダイレクトは拒否します。HTTP 401/403 の場合はソース画面に
-  接続条件を確認するメッセージを表示します。Kanade 自体にユーザー名・パスワードのログイン API はありません。
+  サーバーがクライアント証明書を要求する場合は **Use a client certificate** を選び、
+  ソース画面の **Set up / unlock certificate…** で自分の PKCS#12（`.p12` / `.pfx`）を
+  選択します。マスクされたパスワード欄に入力し、**Unlock and connect** で接続します。
+  他のアプリの設定や証明書には依存しません。選択したファイルへの参照はソース設定に残りますが、
+  パスワード・秘密鍵を `app.json` やカタログへ保存しません。通常はアプリの起動ごとに
+  ファイルを明示的に読み込み、解除した証明書をそのセッションのメモリー内で使用します。
+  macOS では必要な場合だけ **Save in Cadence's Keychain storage** を選び、証明書と
+  パスワードを Cadence 専用の Keychain 項目へ保存できます。保存済みの証明書は
+  **Unlock saved certificate** で読み込み、**Delete saved certificate** で削除します。
+  どちらも明示的な操作で、自動同期や起動時に Keychain を読み取ったり承認画面を表示したりしません。
+  ファイルからの読み込みとセッション内の証明書管理は OS の Keychain に依存しない共通処理です。
+  証明書を送る先は設定した HTTPS origin に限定し、別の origin へのリダイレクトは拒否します。
+  HTTP 401/403 の場合はソース画面に接続条件を確認するメッセージを表示します。
+  Kanade 自体にユーザー名・パスワードのログイン API はありません。
 - **DLNA:** MediaServer の device description URL を入力します。
   ContentDirectory のフォルダー・音声・カバーを扱い、音源 URL は再生時に BrowseMetadata で解決します。
   SSDP 自動検出とリモートスピーカー操作は未対応です。
@@ -132,7 +139,8 @@ Range 非対応の音源も一時停止と再開ができ、バーは操作で�
 開始時に末尾の情報を要求するコンテナーでは、サーバーの Range 対応が必要になる場合があります。
 Rust API の明示的なダウンロードは最大 512 MiB、キャッシュ全体は 2 GiB に制限します。
 ホストでは HTTPS / WSS に対応します。現在の Scarlet 向け transport は HTTP / WS のみで、
-HTTPS / WSS を指定すると明示的にエラーになります。
+HTTPS / WSS を指定すると明示的にエラーになります。これは共通の証明書管理とは別の通信制約で、
+Scarlet の現行 transport ではクライアント証明書が必要な HTTPS サーバーへ接続できません。
 
 ## 検証
 
@@ -180,10 +188,9 @@ PCM デコード・シーク・再接続を確認できます。音声出力や�
 ./scripts/dev cargo run --locked -p cadence-sources --example kanade_smoke -- https://kanade.example.com
 ```
 
-所有者が既存 KanadeApp 証明書の利用を明示的に承認した場合だけ、
-`--authorize-kanade-app-identity` を追加できます。このオプションは macOS の Keychain
-アクセス確認を表示する場合があります。承認後の証明書はその CLI プロセス内だけで使い、
-認証情報をファイルや新しい Keychain 項目へ保存しません。
+この CLI は認証なしのサーバーと loopback fixture 用です。証明書・パスワードの入力や
+Keychain へのアクセスには対応しません。クライアント証明書が必要な実サーバーは、
+Cadence のソース画面で証明書を設定して確認してください。
 Kanade のページング API にはスナップショット識別子がなく、DB エラーも空配列として返すため、
 同期と同時のサーバースキャンや DB 障害をクライアントだけで完全に判別することはできません。
 

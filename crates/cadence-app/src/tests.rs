@@ -1261,6 +1261,7 @@ fn render_offscreen_ui_for_visual_review() {
             "source-connect",
             "kanade-connect",
             "kanade-authorization",
+            "kanade-certificate",
             "artist-albums",
             "album-detail",
             "library-long",
@@ -1294,7 +1295,7 @@ fn render_offscreen_ui_for_visual_review() {
                         .source_url
                         .set("https://kanade.example.com".into());
                 }
-                "kanade-authorization" => {
+                "kanade-authorization" | "kanade-certificate" => {
                     // Render the actual authorization controls without opening
                     // a native window, reading Keychain or dispatching network I/O.
                     app.workspace = Workspace::persistent(
@@ -1307,10 +1308,18 @@ fn render_offscreen_ui_for_visual_review() {
                     );
                     source_entries(&app);
                     let mut sources = app.workspace.sources.get();
-                    sources[0].settings["kanade_app_identity"] = true.into();
+                    sources[0].settings["client_certificate"] = true.into();
                     app.workspace.sources.set(sources);
                     app.workspace.source_entries.set(vec![]);
                     app.workspace.source_status.set("HTTP 403 · Check server access, or authorize the selected client certificate.".into());
+                    if mode == "kanade-certificate" {
+                        app.workspace
+                            .source_page
+                            .set(extension::SourcePage::Certificate);
+                        app.workspace
+                            .certificate_path
+                            .set("/Certificates/client.p12".into());
+                    }
                 }
                 "artist-albums" => prepare_mode(&app, "artists"),
                 "album-detail" => prepare_mode(&app, "albums"),

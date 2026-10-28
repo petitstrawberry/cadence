@@ -25,6 +25,13 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 pub const SOURCE_API_VERSION: u32 = 1;
 
+/// Normalize a user-entered Kanade server address for storage. Bare hostnames
+/// default to HTTPS; explicit HTTP/WS endpoints remain available for local use.
+/// Credentials, unsupported protocols, queries and fragments are rejected.
+pub fn normalize_kanade_url(value: &str) -> Result<String> {
+    kanade::normalize_server_url(value)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SourceConfig {
     pub id: String,
@@ -203,14 +210,39 @@ impl SourceRegistry {
     pub fn validate_config(&self, config: &SourceConfig) -> Result<()> {
         self.plugin(config)?.validate_config(config)
     }
-    /// May show a macOS Keychain prompt. Invoke only after an explicit user
-    /// action, on a worker; background catalogue/media loading never calls this.
-    pub fn authorize_source_identity(&self, config: &SourceConfig) -> Result<()> {
-        self.validate_config(config)?;
+    /// Import/unlock a user-selected PKCS#12 on a worker. The password is not
+    /// persisted unless `remember` explicitly selects the platform secure store.
+    /// The caller must clear its masked input and avoid logging the password.
+    pub fn import_client_identity(
+        &self,
+        config: &SourceConfig,
+        path: &Path,
+        password: &str,
+        remember: bool,
+    ) -> Result<()> {
+        self.plugin(config)?;
         if config.plugin_id != "kanade" {
-            return Err("This source does not support certificate authorization".into());
+            return Err("This source does not support client certificates".into());
         }
-        kanade_tls::Transport::authorize_source(config)
+        kanade_tls::Transport::import_client_identity(config, path, password, remember)
+    }
+    /// Explicit user action only. Unlock this source's Cadence-owned secure
+    /// store entry; background catalogue/media requests never read credentials.
+    pub fn authorize_saved_identity(&self, config: &SourceConfig) -> Result<()> {
+        self.plugin(config)?;
+        if config.plugin_id != "kanade" {
+            return Err("This source does not support client certificates".into());
+        }
+        kanade_tls::Transport::authorize_saved_identity(config)
+    }
+    /// Explicit user action only. Delete this source/origin's saved Cadence
+    /// credential and forget its session. The selected PKCS#12 file is retained.
+    pub fn remove_saved_identity(&self, config: &SourceConfig) -> Result<()> {
+        self.plugin(config)?;
+        if config.plugin_id != "kanade" {
+            return Err("This source does not support client certificates".into());
+        }
+        kanade_tls::Transport::remove_saved_identity(config)
     }
     /// Forget approved in-memory transport state when its source is removed or
     /// certificate access is disabled. This never changes Keychain contents.

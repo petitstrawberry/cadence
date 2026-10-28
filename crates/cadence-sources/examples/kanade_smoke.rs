@@ -3,8 +3,8 @@
 //! No audio is sent to the device and no server playback commands are issued.
 //!
 //! ./scripts/dev cargo run --locked -p cadence-sources --example kanade_smoke -- https://server
-//! Add --authorize-kanade-app-identity only when the owner explicitly approves
-//! using their existing KanadeApp certificate. This can show a system prompt.
+//! This CLI uses no credentials or Keychain access. Configure servers requiring
+//! a client certificate through Cadence's source setup instead.
 use cadence_core::{DecoderRegistry, Track};
 use cadence_library::Library;
 use cadence_sources::{SourceConfig, SourceRegistry};
@@ -18,27 +18,24 @@ use std::{
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let url = args.next().ok_or("Pass the Kanade server base URL")?;
-    let identity = match args.next().as_deref() {
-        None => false,
-        Some("--authorize-kanade-app-identity") if args.next().is_none() => true,
-        _ => {
-            return Err(
-                "Usage: kanade_smoke <server-base-url> [--authorize-kanade-app-identity]".into(),
-            );
-        }
-    };
+    if args.next().is_some() {
+        return Err("Usage: kanade_smoke <server-base-url>. Certificate and password options are not supported; configure client certificates in Cadence.".into());
+    }
     let config = SourceConfig {
         id: "kanade-smoke".into(),
         name: "Kanade integration check".into(),
         plugin_id: "kanade".into(),
-        settings: serde_json::json!({"url": url, "kanade_app_identity": identity}),
+        settings: serde_json::json!({"url": url}),
     };
     let registry = SourceRegistry::builtin();
-    if identity {
-        registry.authorize_source_identity(&config)?;
-    }
     let cancel = Arc::new(AtomicBool::new(false));
-    let tracks = registry.catalog_cancellable(&config, &cancel)?;
+    let tracks = registry.catalog_cancellable(&config, &cancel).map_err(|error| {
+        if error.contains("HTTP 401") || error.contains("HTTP 403") {
+            format!("{error} This smoke CLI does not load client certificates; use Cadence's source setup when a certificate is required.")
+        } else {
+            error
+        }
+    })?;
     let albums = tracks
         .iter()
         .filter_map(|track| track.album_id.as_deref())

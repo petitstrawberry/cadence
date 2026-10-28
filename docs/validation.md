@@ -1,10 +1,33 @@
 # 検証記録
 
-## 2026-10-28 — Kanade のライブラリー同期とクライアント証明書
+## 2026-10-28 — Cadence 単独の証明書管理
+
+KanadeApp の設定を再利用する初期試作は、Cadence 自身で証明書を設定する方式へ置き換えました。
+ソース画面で PKCS#12（`.p12` / `.pfx`）を選び、マスクされたパスワード欄から解除します。
+ファイル読み込みとセッション内の証明書管理は共通処理で、他アプリや macOS Keychain を必須にしません。
+macOS で明示的に保存を選んだ場合だけ、Cadence 専用の Keychain 項目を使用します。
+保存済み証明書の読み込み・削除も明示的な操作で、自動同期は解除済みのメモリー内証明書だけを使います。
+Scarlet の HTTP / WS のみという既存 transport 制限は別に残ります。
+
+- 切替後の `cadence-sources` 単体テストは **65 passed / 0 failed**。
+  合成データによる検査で、実 Keychain・実証明書は利用していません。
+  Scarlet AArch64 向けの `cadence-sources` コンパイルも成功しました。
+  これはアプリ全体のビルドや Scarlet 上の暗号通信・実行の確認ではありません。
+  ログは `artifacts/kanade-integration/standalone-credentials-source-tests.log` と
+  `standalone-credentials-scarlet-check.log` です。
+- `kanade_smoke` は認証なしの疎通確認だけに限定しました。証明書を利用する CLI オプションや
+  パスワード入力はなく、実証明書が必要な接続はアプリのソース画面で確認します。
+- 新方式の workspace 全体は **281 passed / 0 failed / 1 ignored**。
+  パスワード欄は入力・貼り付け・取り消し・マスク表示の合成テストを通過しました。
+  新方式の実 Keychain と実サーバーの認証、ネイティブ操作は未検証です。
+  以下の 263 件とネイティブ 2 曲同期の結果は切替前の記録で、新方式の検証完了を示すものではありません。
+  実際の Keychain 保存・読み込み・削除や実サービスの再生を検証済みとは扱っていません。
+
+## 2026-10-28 — Kanade のライブラリー同期（独立した証明書管理への切替前）
 
 Cadence `877f521` をベースに、Kanade develop
-`e00a3bf531e4598e717dbdfd1ba6cea9c641308c` の Rust protocol / server / DB 実装と
-KanadeApp の既存 Keychain 実装を参照しました。
+`e00a3bf531e4598e717dbdfd1ba6cea9c641308c` の Rust protocol / server / DB 実装を参照しました。
+初期調査では KanadeApp の既存 Keychain 実装も参照しました。この再利用経路は現在は廃止しています。
 
 - `./scripts/dev cargo test --locked --workspace -- --test-threads=1`:
   **263 passed / 0 failed / 1 ignored**。ignored は既存の実 CLAP Gain を要求するテストです。
@@ -21,8 +44,8 @@ KanadeApp の既存 Keychain 実装を参照しました。
   リダイレクトを、接続前に拒否することも確認しました。
 - 合成の CA / client certificate / PKCS#12 による、クライアント証明書必須の HTTPS と
   WSS の往復に成功。実 Keychain へのアクセス・承認ダイアログは実行していません。
-  実証明書は明示的な **Authorize certificate…** 操作だけで読み取る設計で、
-  background は当該アプリ起動中に承認済みのメモリー内キャッシュだけを使用します。
+  初期試作では **Authorize certificate…** という明示的な操作とメモリー内キャッシュを設けました。
+  この旧画面・他アプリの証明書を再利用する経路は、上記の Cadence 単独方式で置き換えています。
 - `kanade_smoke` を loopback fixture に実行し、2 曲の Library 登録・検索、64×64 カバーの
   デコード、44.1 kHz PCM のデコード、5 秒位置へのシーク、別セッションでの再開に成功。
   音源とカタログを保存せず、音声出力やサーバーの再生操作を行わない検査です。
@@ -32,10 +55,14 @@ KanadeApp の既存 Keychain 実装を参照しました。
   Cadence の新しい API でも HTTP 403 を明示した接続エラーを確認しました。
   実証明書は利用せず、実ライブラリー・画像・再生の検証は接続条件の確認または所有者の
   明示的な証明書選択・システム承認待ちです。サーバー・ネットワーク設定は変更していません。
-- CUA の `cua.getApp` で独立した `Cadence Kanade QA.app` を開く操作は、承認待ち後に
-  `aborted by user` となりました。UI 状態が返らず起動結果は不確定のため、再試行・入力操作を
-  行わず、ネイティブ画面での確認は未完了です。テストサーバーは停止済みです。
-  独立した CPU renderer の検査は完了し、最小／標準サイズの 44 画面を生成。
+- 最初の `Cadence Kanade QA.app` 起動は中断されましたが、その後、所有者の明示的な
+  起動指示に従い、別の `Cadence Kanade Review.app` を CUA で起動しました。
+  review 用データディレクトリーを分離し、ネイティブ画面で loopback の Kanade source を
+  登録。**Library synced · 2 songs** とアルバム一覧を確認し、保存カタログも 2 曲でした。
+  その後は所有者が実サーバーの source と証明書オプションを設定し、証明書承認ボタンが
+  表示されるところまで確認しました。エージェントによる実証明書の読み取りはありません。
+  ネイティブでの実サービスの再生は未検証です。起動処理の承認待ちは解消しています。
+  独立した CPU renderer の検査では、最小／標準サイズの 44 画面を生成。
   Kanade 接続フォームと証明書承認画面の画像を目視し、重なり・切れがないことを確認しました。
   これはネイティブウィンドウ操作や OS の認証ダイアログの検証とは別です。
 

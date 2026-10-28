@@ -16,10 +16,14 @@ pub enum LibraryCommand {
     Scan(PathBuf),
     Rescan,
     RemoveRoot(PathBuf),
-    RemoveSource(String),
+    RemoveSource {
+        source: String,
+        credential_config: Option<cadence_sources::SourceConfig>,
+    },
     AuthorizeSource {
         config: cadence_sources::SourceConfig,
         cancel: Arc<AtomicBool>,
+        request: IdentityRequest,
     },
     Upsert(Vec<LibraryTrack>),
     SyncSource {
@@ -27,6 +31,38 @@ pub enum LibraryCommand {
         control: Arc<SourceSyncControl>,
     },
     Remove(String),
+}
+
+/// Credentials are only held in a bounded worker request and are erased on
+/// drop. Debug output must never expose the entered PKCS#12 password.
+pub enum IdentityRequest {
+    Import {
+        path: PathBuf,
+        password: zeroize::Zeroizing<String>,
+        remember: bool,
+    },
+    Saved,
+    RemoveSaved,
+}
+#[derive(Clone, Copy)]
+enum IdentityPersistence {
+    Unchanged,
+    Saved,
+    Removed,
+}
+impl std::fmt::Debug for IdentityRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Import { path, remember, .. } => formatter
+                .debug_struct("Import")
+                .field("path", path)
+                .field("password", &"[REDACTED]")
+                .field("remember", remember)
+                .finish(),
+            Self::Saved => formatter.write_str("Saved"),
+            Self::RemoveSaved => formatter.write_str("RemoveSaved"),
+        }
+    }
 }
 
 /// Cancellation wins before saving starts; once saving starts the UI waits for
@@ -342,7 +378,7 @@ impl LibraryState {
             _ => None,
         };
         let removal = match &command {
-            LibraryCommand::RemoveSource(source) => Some(source.clone()),
+            LibraryCommand::RemoveSource { source, .. } => Some(source.clone()),
             _ => None,
         };
         let authorized = match &command {
@@ -395,39 +431,79 @@ impl LibraryState {
                 ),
                 Err(error) => return self.event("Unable to remove source".into(), Some(error)),
             },
-            LibraryCommand::RemoveSource(source) => {
-                let count = candidate.remove_source(&source);
-                let mut event = self.commit(
-                    candidate,
-                    format!("Source removed · {count} songs removed from library"),
-                    None,
-                );
-                if event.error.is_none() {
-                    cadence_sources::SourceRegistry::builtin().forget_source_identity(&source);
-                    event.removed_source = Some(source);
+            LibraryCommand::RemoveSource {
+                source,
+                credential_config,
+            } => {
+                if credential_config
+                    .as_ref()
+                    .is_some_and(|config| config.id != source || config.plugin_id != "kanade")
+                {
+                    return self.event("Source removal failed · Library unchanged".into(), Some("Certificate cleanup configuration does not match this Kanade source; source and library retained".into()));
                 }
-                return event;
+                return self.remove_source_with_cleanup(&source, || {
+                    #[cfg(target_os = "macos")]
+                    if let Some(config) = credential_config {
+                        cadence_sources::SourceRegistry::builtin()
+                            .remove_saved_identity(&config)?;
+                        return Ok(true);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = credential_config;
+                    Ok(false)
+                });
             }
-            LibraryCommand::AuthorizeSource { config, cancel } => {
+            LibraryCommand::AuthorizeSource {
+                config,
+                cancel,
+                request,
+            } => {
                 if cancel.load(Ordering::Acquire) {
-                    return self.event(
-                        "Certificate authorization cancelled".into(),
-                        Some("Certificate authorization cancelled".into()),
-                    );
+                    return self.cancelled_identity_authorization(IdentityPersistence::Unchanged);
                 }
                 let registry = cadence_sources::SourceRegistry::builtin();
-                let result = registry.authorize_source_identity(&config);
+                let remember = matches!(&request, IdentityRequest::Import { remember: true, .. });
+                let remove_saved = matches!(&request, IdentityRequest::RemoveSaved);
+                let result = match request {
+                    IdentityRequest::Import {
+                        path,
+                        password,
+                        remember,
+                    } => {
+                        registry.import_client_identity(&config, &path, password.as_str(), remember)
+                    }
+                    IdentityRequest::Saved => registry.authorize_saved_identity(&config),
+                    IdentityRequest::RemoveSaved => registry.remove_saved_identity(&config),
+                };
                 if cancel.load(Ordering::Acquire) {
                     registry.forget_source_identity(&config.id);
-                    return self.event(
-                        "Certificate authorization cancelled".into(),
-                        Some("Certificate authorization cancelled".into()),
-                    );
+                    // The native save may already have succeeded. Cancel only
+                    // the connection; never claim stored credentials vanished.
+                    return self.cancelled_identity_authorization(if result.is_ok() && remember {
+                        IdentityPersistence::Saved
+                    } else if result.is_ok() && remove_saved {
+                        IdentityPersistence::Removed
+                    } else {
+                        IdentityPersistence::Unchanged
+                    });
                 }
                 return match result {
-                    Ok(()) => self.event("Client certificate authorized".into(), None),
+                    Ok(()) => self.event(
+                        if remove_saved {
+                            "Saved certificate removed; new connections locked"
+                        } else {
+                            "Client certificate authorized"
+                        }
+                        .into(),
+                        None,
+                    ),
                     Err(error) => self.event(
-                        "Client certificate authorization failed".into(),
+                        if remove_saved {
+                            "Saved certificate removal failed"
+                        } else {
+                            "Client certificate authorization failed"
+                        }
+                        .into(),
                         Some(error),
                     ),
                 };
@@ -471,6 +547,54 @@ impl LibraryState {
             LibraryCommand::Load => unreachable!("load was handled above"),
         };
         self.commit(candidate, status, warning)
+    }
+
+    /// A secure-store deletion cannot be rolled back by a failed JSON save.
+    /// Keep catalog/config on either failure and describe any completed cleanup.
+    fn remove_source_with_cleanup(
+        &mut self,
+        source: &str,
+        cleanup: impl FnOnce() -> Result<bool, String>,
+    ) -> LibraryEvent {
+        let credential_removed = match cleanup() {
+            Ok(removed) => removed,
+            Err(error) => {
+                return self.event(
+                    "Source removal failed · Library unchanged".into(),
+                    Some(format!(
+                        "Certificate cleanup failed; source and library retained: {error}"
+                    )),
+                );
+            }
+        };
+        let mut candidate = self.library.clone();
+        let count = candidate.remove_source(source);
+        let mut event = self.commit(
+            candidate,
+            format!("Source removed · {count} songs removed from library"),
+            None,
+        );
+        if event.error.is_none() {
+            cadence_sources::SourceRegistry::builtin().forget_source_identity(source);
+            event.removed_source = Some(source.to_owned());
+        } else if credential_removed {
+            let error = event.error.take().unwrap_or_default();
+            event.error = Some(format!(
+                "Saved certificate was already removed from Cadence Keychain; source and library retained because the library could not be saved: {error}"
+            ));
+        }
+        event
+    }
+
+    fn cancelled_identity_authorization(&self, persistence: IdentityPersistence) -> LibraryEvent {
+        let message = match persistence {
+            IdentityPersistence::Saved => {
+                "Connection cancelled; certificate was saved in Cadence Keychain"
+            }
+            IdentityPersistence::Removed => "Saved certificate removed; connection cancelled",
+            IdentityPersistence::Unchanged => "Certificate authorization cancelled",
+        };
+        self.event(message.into(), Some(message.into()))
     }
 
     fn replace_source(
@@ -788,9 +912,14 @@ mod tests {
                         id: "test".into(),
                         name: "Test".into(),
                         plugin_id: "kanade".into(),
-                        settings: serde_json::json!({"url":url,"kanade_app_identity":true}),
+                        settings: serde_json::json!({"url":url,"client_certificate":true}),
                     },
                     cancel: Arc::new(AtomicBool::new(cancelled)),
+                    request: IdentityRequest::Import {
+                        path: directory.0.join("missing-test-identity.p12"),
+                        password: zeroize::Zeroizing::new("synthetic-password".into()),
+                        remember: false,
+                    },
                 },
                 &AtomicBool::new(false),
             );
@@ -799,6 +928,80 @@ mod tests {
             assert_eq!(event.tracks, vec![track("existing")]);
             assert_eq!(std::fs::read(&path).unwrap(), original);
         }
+    }
+
+    #[test]
+    fn late_identity_cancellation_does_not_claim_a_completed_keychain_save_was_undone() {
+        let directory = Directory::new();
+        let mut state = LibraryState::new(directory.0.join("library.json"));
+        state.library.upsert(track("existing")).unwrap();
+        let saved = state.cancelled_identity_authorization(IdentityPersistence::Saved);
+        assert_eq!(
+            saved.error.as_deref(),
+            Some("Connection cancelled; certificate was saved in Cadence Keychain")
+        );
+        assert_eq!(saved.tracks, vec![track("existing")]);
+        let not_saved = state.cancelled_identity_authorization(IdentityPersistence::Unchanged);
+        assert_eq!(
+            not_saved.error.as_deref(),
+            Some("Certificate authorization cancelled")
+        );
+        assert!(!not_saved.status.contains("saved"));
+        let removed = state.cancelled_identity_authorization(IdentityPersistence::Removed);
+        assert_eq!(
+            removed.error.as_deref(),
+            Some("Saved certificate removed; connection cancelled")
+        );
+    }
+
+    #[test]
+    fn malformed_identity_import_preserves_library_without_accessing_a_credential_store() {
+        let directory = Directory::new();
+        let path = directory.0.join("library.json");
+        let identity = directory.0.join("synthetic-invalid.p12");
+        std::fs::write(&identity, b"not a PKCS12 identity").unwrap();
+        let mut state = LibraryState::new(path.clone());
+        state.library.upsert(track("existing")).unwrap();
+        state.library.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let event = state.run(LibraryCommand::AuthorizeSource {
+            config: cadence_sources::SourceConfig {
+                id: "synthetic".into(), name: "Synthetic".into(), plugin_id: "kanade".into(),
+                settings: serde_json::json!({"url":"https://example.invalid","client_certificate":true}),
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            request: IdentityRequest::Import {
+                path: identity,
+                password: zeroize::Zeroizing::new("synthetic".into()),
+                remember: false,
+            },
+        }, &AtomicBool::new(false));
+        assert_eq!(event.authorized_source.as_deref(), Some("synthetic"));
+        assert!(event.error.is_some());
+        assert_eq!(event.tracks, vec![track("existing")]);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn identity_request_debug_redacts_the_password_including_queued_command() {
+        let request = IdentityRequest::Import {
+            path: PathBuf::from("synthetic-identity.p12"),
+            password: zeroize::Zeroizing::new("sensitive-synthetic-password".into()),
+            remember: false,
+        };
+        let command = LibraryCommand::AuthorizeSource {
+            config: cadence_sources::SourceConfig {
+                id: "test".into(),
+                name: "Test".into(),
+                plugin_id: "kanade".into(),
+                settings: serde_json::json!({"url":"https://example.invalid","client_certificate":true}),
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            request,
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("sensitive-synthetic-password"));
     }
 
     #[test]
@@ -1188,6 +1391,71 @@ mod source_removal_tests {
         }
     }
     #[test]
+    fn source_removal_retains_catalog_when_synthetic_credential_cleanup_or_save_fails() {
+        let directory =
+            std::env::temp_dir().join(format!("cadence-source-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("library.json");
+        let mut state = LibraryState::new(path.clone());
+        state
+            .library
+            .upsert_many([entry("remove"), entry("keep")])
+            .unwrap();
+        state.library.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // The injected cleanup results never access a native credential store.
+        let failed =
+            state.remove_source_with_cleanup("remove", || Err("Synthetic cleanup failure".into()));
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("source and library retained")
+        );
+        assert!(failed.removed_source.is_none());
+        assert_eq!(failed.tracks.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        state.path = directory.clone();
+        let saved = state.remove_source_with_cleanup("remove", || Ok(true));
+        assert!(
+            saved
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Saved certificate was already removed")
+        );
+        assert!(saved.removed_source.is_none());
+        assert_eq!(saved.tracks.len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_removal_rejects_mismatched_credential_scope_before_cleanup() {
+        let mut state = LibraryState::new(PathBuf::from("unused-mismatched-catalog.json"));
+        state.library.upsert(entry("remove")).unwrap();
+        for (id, plugin_id) in [("other-source", "kanade"), ("remove", "dlna")] {
+            let event = state.run(
+                LibraryCommand::RemoveSource {
+                    source: "remove".into(),
+                    credential_config: Some(cadence_sources::SourceConfig {
+                        id: id.into(),
+                        name: "Synthetic".into(),
+                        plugin_id: plugin_id.into(),
+                        settings: serde_json::json!({"url":"https://example.invalid"}),
+                    }),
+                },
+                &AtomicBool::new(false),
+            );
+            assert!(event.error.as_deref().unwrap().contains("does not match"));
+            assert_eq!(event.source_removal.as_deref(), Some("remove"));
+            assert!(event.removed_source.is_none());
+            assert_eq!(event.tracks, vec![entry("remove")]);
+        }
+    }
+
+    #[test]
     fn source_removal_is_published_only_after_persistence_succeeds() {
         let directory =
             std::env::temp_dir().join(format!("cadence-source-removal-{}", std::process::id()));
@@ -1201,13 +1469,25 @@ mod source_removal_tests {
         );
         let before = std::fs::read(&path).unwrap();
         state.path = directory.clone(); // A directory cannot be replaced by a catalog.
-        let rejected = state.run(LibraryCommand::RemoveSource("remove".into()), &cancel);
+        let rejected = state.run(
+            LibraryCommand::RemoveSource {
+                source: "remove".into(),
+                credential_config: None,
+            },
+            &cancel,
+        );
         assert!(rejected.error.is_some());
         assert!(rejected.removed_source.is_none());
         assert_eq!(rejected.tracks.len(), 2);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         state.path = path.clone();
-        let committed = state.run(LibraryCommand::RemoveSource("remove".into()), &cancel);
+        let committed = state.run(
+            LibraryCommand::RemoveSource {
+                source: "remove".into(),
+                credential_config: None,
+            },
+            &cancel,
+        );
         assert!(committed.error.is_none());
         assert_eq!(committed.removed_source.as_deref(), Some("remove"));
         assert_eq!(committed.tracks, vec![entry("keep")]);

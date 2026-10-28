@@ -23,14 +23,13 @@ pub(crate) struct KanadePlugin;
 impl SourcePlugin for KanadePlugin {
     fn validate_config(&self, config: &SourceConfig) -> Result<()> {
         let url = websocket_url(config)?;
-        if let Some(identity) = config.settings.get("kanade_app_identity") {
-            let enabled = identity
-                .as_bool()
-                .ok_or("Kanade certificate setting must be true or false")?;
-            if enabled && url.scheme() != "wss" {
-                return Err(
-                    "Kanade client certificates require an HTTPS or WSS server address".into(),
-                );
+        if crate::kanade_tls::certificate_enabled(config)? && url.scheme() != "wss" {
+            return Err("Kanade client certificates require an HTTPS or WSS server address".into());
+        }
+        if let Some(path) = config.settings.get("certificate_path") {
+            let path = path.as_str().ok_or("Certificate file path must be text")?;
+            if !path.is_empty() && !std::path::Path::new(path).is_absolute() {
+                return Err("Certificate file path must be absolute".into());
             }
         }
         Ok(())
@@ -296,12 +295,42 @@ fn media_path(kind: &str, id: &str) -> Result<String> {
         .push(id);
     Ok(url.path().to_owned())
 }
-fn websocket_url(config: &SourceConfig) -> Result<Url> {
-    let value = config
-        .settings
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or("Kanade source needs a URL")?;
+/// Normalize user-entered server addresses before they enter persistent config.
+/// A bare hostname defaults to TLS; explicit protocols retain their semantics.
+pub(crate) fn normalize_server_url(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err("Enter a Kanade hostname or an HTTP/HTTPS server URL".into());
+    }
+    let absolute = if value.contains("://") {
+        value.to_owned()
+    } else {
+        let authority = value.split('/').next().unwrap_or_default();
+        let bare_host = if authority.starts_with('[') && authority.ends_with(']') {
+            true
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            // Avoid interpreting an unsupported URI scheme as a hostname.
+            // Dotted hosts, localhost and bracketed IPs may include a port.
+            (host.contains('.')
+                || host == "localhost"
+                || (host.starts_with('[') && host.ends_with(']')))
+                && port.parse::<u16>().is_ok()
+        } else {
+            !authority.is_empty()
+        };
+        if !bare_host {
+            return Err("Kanade server URL must use HTTP, HTTPS, WS, or WSS".into());
+        }
+        format!("https://{value}")
+    };
+    Ok(server_url(&absolute)?.to_string())
+}
+
+fn server_url(value: &str) -> Result<Url> {
     let mut url = Url::parse(value).map_err(|_| "Invalid Kanade URL")?;
     match url.scheme() {
         "ws" => {
@@ -312,10 +341,20 @@ fn websocket_url(config: &SourceConfig) -> Result<Url> {
         }
         _ => {}
     }
-    let mut url = net::http_url(url.as_str())?;
+    let url = net::http_url(url.as_str())?;
     if url.query().is_some() || url.fragment().is_some() {
         return Err("Kanade URL must not contain query parameters or a fragment".into());
     }
+    Ok(url)
+}
+
+fn websocket_url(config: &SourceConfig) -> Result<Url> {
+    let value = config
+        .settings
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("Kanade source needs a URL")?;
+    let mut url = server_url(value)?;
     if !url.path().trim_end_matches('/').ends_with("/ws") {
         url.path_segments_mut()
             .map_err(|_| "Invalid Kanade URL")?
@@ -580,6 +619,44 @@ mod tests {
             media_path("tracks", "a/b ?").unwrap(),
             "/media/tracks/a%2Fb%20%3F"
         );
+    }
+    #[test]
+    fn entered_server_addresses_default_to_https_without_weakening_validation() {
+        for (entered, expected) in [
+            (" kanade.ichigo.dev ", "https://kanade.ichigo.dev/"),
+            (
+                "kanade.ichigo.dev:8443/music",
+                "https://kanade.ichigo.dev:8443/music",
+            ),
+            ("localhost:8080", "https://localhost:8080/"),
+            ("[::1]:8080", "https://[::1]:8080/"),
+            ("http://localhost:8080", "http://localhost:8080/"),
+            (
+                "http://127.0.0.1:8080/kanade/",
+                "http://127.0.0.1:8080/kanade/",
+            ),
+            ("wss://kanade.ichigo.dev/ws", "https://kanade.ichigo.dev/ws"),
+        ] {
+            assert_eq!(normalize_server_url(entered).unwrap(), expected);
+        }
+        for entered in [
+            "ftp://example.com",
+            "file:///music",
+            "javascript:alert(1)",
+            "mailto:user@example.com",
+            "kanade.\nichigo.dev",
+            "https://kanade.\tichigo.dev",
+            "https://user:secret@example.com",
+            "user@example.com",
+            "user:secret@example.com",
+            "/music",
+            "//example.com",
+            "https://example.com?token=secret",
+            "example.com#fragment",
+            "",
+        ] {
+            assert!(normalize_server_url(entered).is_err());
+        }
     }
     #[test]
     fn albumless_tracks_have_no_empty_artwork_reference() {
@@ -901,7 +978,7 @@ mod protocol_tests {
     #[test]
     fn certificate_configuration_requires_https_before_persistence() {
         let mut insecure_identity = config("http://localhost".into());
-        insecure_identity.settings = json!({"url":"http://localhost", "kanade_app_identity":true});
+        insecure_identity.settings = json!({"url":"http://localhost", "client_certificate":true});
         assert!(
             SourceRegistry::builtin()
                 .validate_config(&insecure_identity)

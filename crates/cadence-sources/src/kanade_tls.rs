@@ -1,86 +1,139 @@
-//! Optional reuse of KanadeApp's existing macOS client identity.
+//! Cadence-owned client identities, independent of any other application.
 //!
-//! Only an explicit user authorization action reads the named Keychain items. The
-//! PKCS#12 is decoded in memory: importing it through Security.framework or
-//! native-tls would create a default or temporary keychain. Credentials never
-//! enter SourceConfig, logs, cache files, or a new Keychain item.
+//! Every platform reads a user-selected PKCS#12 file and decodes it in memory.
+//! The portable path retains only the encrypted file reference in SourceConfig;
+//! the password is never serialized. Optional macOS persistence is isolated in
+//! `secure_store`, under Cadence's own service and source/origin-scoped account.
+//! Background requests use only an explicitly unlocked process-memory identity.
 
 use crate::{Result, SourceConfig};
-use std::time::Duration;
+use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::File,
+    io::Read,
+    path::Path,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use url::Url;
+use zeroize::Zeroizing;
+
+const MAX_PKCS12_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PASSWORD_BYTES: usize = 16 * 1024;
+const MAX_IDENTITIES: usize = 16;
+const LOCKED: &str = "Unlock this source's client certificate in Cadence before connecting";
+
+// No Debug implementation: private key bytes must never enter logs or errors.
+struct IdentityMaterial {
+    certificates: Vec<Vec<u8>>,
+    private_key: Zeroizing<Vec<u8>>,
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct Transport {
     identity_origin: Option<Url>,
-    #[cfg(target_os = "macos")]
-    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+    #[cfg(not(target_os = "scarlet"))]
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Transport {
     pub(crate) fn for_source(config: &SourceConfig) -> Result<Self> {
-        let enabled = match config.settings.get("kanade_app_identity") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .ok_or("Kanade certificate setting must be true or false")?,
-        };
-        if !enabled {
+        if !certificate_enabled(config)? {
             return Ok(Self::default());
         }
         let origin = identity_origin(config)?;
-        #[cfg(not(target_os = "macos"))]
+        let identity = cached_identity(&cache_key(config, &origin))?;
+        #[cfg(not(target_os = "scarlet"))]
         {
-            let _ = origin;
-            Err("KanadeApp Keychain certificates are available only on macOS".into())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let tls = macos::authorized_identity(config, &origin)?;
             Ok(Self {
                 identity_origin: Some(origin),
-                tls: Some(tls),
+                tls: Some(Arc::new(tls_config(&identity, public_roots())?)),
             })
         }
+        #[cfg(target_os = "scarlet")]
+        {
+            let _ = identity;
+            Err("This Scarlet build does not yet support HTTPS / WSS transport; the client certificate is unlocked but cannot be used over plaintext".into())
+        }
     }
 
-    /// Only call in direct response to the user choosing "Authorize certificate".
-    /// This can display macOS Keychain authorization dialogs. Background browse,
-    /// refresh, startup, artwork and playback must use `for_source` instead.
-    pub(crate) fn authorize_source(config: &SourceConfig) -> Result<()> {
-        if config
-            .settings
-            .get("kanade_app_identity")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            return Err("Enable the KanadeApp certificate for this source first".into());
+    /// User-initiated import/unlock only. All file I/O and cryptography belongs
+    /// on a worker. `remember` is explicit consent to the platform secure store.
+    pub(crate) fn import_client_identity(
+        config: &SourceConfig,
+        path: &Path,
+        password: &str,
+        remember: bool,
+    ) -> Result<()> {
+        require_certificate(config)?;
+        let origin = identity_origin(config)?;
+        if remember && !cfg!(target_os = "macos") {
+            return Err("Secure credential storage is not available on this platform; unlock the selected PKCS#12 for this session without Remember".into());
+        }
+        if password.len() > MAX_PASSWORD_BYTES {
+            return Err("Certificate password exceeds the size limit".into());
+        }
+        let key = cache_key(config, &origin);
+        store_authorized_identity(key.clone(), remember, || {
+            let pkcs12 = read_pkcs12(path)?;
+            let identity = decode_identity(&pkcs12, password)?;
+            validate_identity(&identity)?;
+            if remember {
+                secure_store::save(&key, &pkcs12, password)?;
+            }
+            Ok(identity)
+        })
+        .map(|_| ())
+    }
+
+    /// Explicit user action only; may show a platform secure-store prompt.
+    pub(crate) fn authorize_saved_identity(config: &SourceConfig) -> Result<()> {
+        require_certificate(config)?;
+        let origin = identity_origin(config)?;
+        let key = cache_key(config, &origin);
+        store_authorized_identity(key.clone(), false, || {
+            let record = secure_store::load(&key)?;
+            let (pkcs12, password) = decode_saved_record(&record)?;
+            let identity = decode_identity(pkcs12, password)?;
+            validate_identity(&identity)?;
+            Ok(identity)
+        })
+        .map(|_| ())
+    }
+
+    /// Explicit user action; deletes only this source/origin's Cadence-owned
+    /// secure-store entry. It never removes the user-selected certificate file.
+    pub(crate) fn remove_saved_identity(config: &SourceConfig) -> Result<()> {
+        if config.id.is_empty() {
+            return Err("Source instance ID must not be empty".into());
         }
         let origin = identity_origin(config)?;
-        #[cfg(target_os = "macos")]
-        {
-            macos::authorize_identity(config, &origin).map(|_| ())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = origin;
-            Err("KanadeApp Keychain certificates are available only on macOS".into())
-        }
+        Self::forget_source(&config.id);
+        secure_store::remove(&cache_key(config, &origin))
     }
 
+    /// Clears process-memory authorization only. A user's selected file and
+    /// explicitly remembered secure-store entry are retained.
     pub(crate) fn forget_source(source_id: &str) {
-        #[cfg(target_os = "macos")]
-        macos::forget_source(source_id);
-        #[cfg(not(target_os = "macos"))]
-        let _ = source_id;
+        let mut cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.entries.retain(|((id, _), _)| id != source_id);
+        if let Some(generation) = cache.generations.get(source_id).and_then(Weak::upgrade) {
+            generation.fetch_add(1, Ordering::Relaxed);
+        }
+        cache
+            .generations
+            .retain(|_, generation| generation.strong_count() > 0);
     }
 
     #[cfg(not(target_os = "scarlet"))]
     pub(crate) fn ws_connector(&self) -> Option<tungstenite::Connector> {
-        #[cfg(target_os = "macos")]
-        if let Some(tls) = &self.tls {
-            return Some(tungstenite::Connector::Rustls(tls.clone()));
-        }
-        None
+        self.tls
+            .as_ref()
+            .map(|tls| tungstenite::Connector::Rustls(tls.clone()))
     }
 
     pub(crate) fn http_agent(&self) -> ureq::Agent {
@@ -88,10 +141,8 @@ impl Transport {
             .timeout_connect(Duration::from_secs(3))
             .timeout_read(Duration::from_secs(2))
             .timeout_write(Duration::from_secs(2))
-            // A redirected request must not present the client identity to a
-            // different origin. Callers validate any explicit redirect first.
             .redirects(0);
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "scarlet"))]
         let builder = match &self.tls {
             Some(tls) => builder.tls_config(tls.clone()),
             None => builder,
@@ -99,7 +150,6 @@ impl Transport {
         builder.build()
     }
 
-    /// Apply before every media request, including an explicit redirect.
     pub(crate) fn validate_media_url(&self, value: &str) -> Result<()> {
         let url = crate::net::http_url(value)?;
         if let Some(origin) = &self.identity_origin
@@ -111,231 +161,343 @@ impl Transport {
     }
 }
 
+pub(crate) fn certificate_enabled(config: &SourceConfig) -> Result<bool> {
+    // Old configs must not silently change identity ownership or access another
+    // application's credentials. The owner must configure a Cadence identity.
+    if config
+        .settings
+        .get("kanade_app_identity")
+        .is_some_and(|value| value != &serde_json::Value::Bool(false))
+    {
+        return Err("This source uses a legacy certificate setting. Configure a client certificate directly in Cadence".into());
+    }
+    match config.settings.get("client_certificate") {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "Client certificate setting must be true or false".into()),
+    }
+}
+
+fn require_certificate(config: &SourceConfig) -> Result<()> {
+    if !certificate_enabled(config)? {
+        return Err("Enable Client certificate for this source first".into());
+    }
+    if config.id.is_empty() {
+        return Err("Source instance ID must not be empty".into());
+    }
+    Ok(())
+}
+
 fn identity_origin(config: &SourceConfig) -> Result<Url> {
     let value = config
         .settings
         .get("url")
         .and_then(serde_json::Value::as_str)
         .ok_or("Kanade source needs a URL")?;
-    let mut url = Url::parse(value).map_err(|_| "Invalid Kanade URL")?;
+    // Credential management is portable even when a platform transport cannot
+    // open HTTPS yet; do not route this through transport availability checks.
+    let value = value.trim();
+    let absolute = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
+    };
+    let mut url = Url::parse(&absolute).map_err(|_| "Invalid Kanade URL")?;
     if url.scheme() == "wss" {
         url.set_scheme("https").map_err(|_| "Invalid Kanade URL")?;
     }
-    let url = crate::net::http_url(url.as_str())?;
-    if url.scheme() != "https" {
-        return Err("Kanade client certificates require an HTTPS or WSS server address".into());
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err("Client certificates require an HTTPS or WSS server address".into());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("Certificate server address must not contain credentials, query parameters, or a fragment".into());
     }
     Ok(url)
 }
 
-#[cfg(target_os = "macos")]
-mod macos {
-    use super::*;
-    use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex, OnceLock},
-    };
-    use zeroize::Zeroizing;
-
-    const KEYCHAIN_UNAVAILABLE: &str = "KanadeApp certificate is unavailable or needs macOS Keychain authorization. Set up TLS / mTLS in KanadeApp, then choose Authorize certificate in this source";
-    const AUTHORIZATION_REQUIRED: &str = "Choose Authorize certificate in this source to use the KanadeApp certificate for this Cadence session";
-    const MAX_IDENTITIES: usize = 16;
-
-    type CacheKey = (String, String);
-    #[derive(Default)]
-    struct IdentityCache {
-        entries: VecDeque<(CacheKey, Arc<rustls::ClientConfig>)>,
-        generation: u64,
+fn read_pkcs12(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    if !path.is_absolute() {
+        return Err("Choose an absolute path to a PKCS#12 certificate file".into());
     }
-    fn identity_cache() -> &'static Mutex<IdentityCache> {
-        static CACHE: OnceLock<Mutex<IdentityCache>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(IdentityCache::default()))
+    let file = File::open(path).map_err(|_| "Cannot open the selected certificate file")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Cannot inspect the selected certificate file")?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PKCS12_BYTES as u64 {
+        return Err("Certificate must be a nonempty regular PKCS#12 file of at most 4 MiB".into());
     }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_PKCS12_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Cannot read the selected certificate file")?;
+    if bytes.len() > MAX_PKCS12_BYTES {
+        return Err("Certificate file exceeds the 4 MiB limit".into());
+    }
+    Ok(bytes)
+}
 
-    pub(super) fn forget_source(source_id: &str) {
+type CacheKey = (String, String);
+fn cache_key(config: &SourceConfig, origin: &Url) -> CacheKey {
+    (config.id.clone(), origin.origin().ascii_serialization())
+}
+#[derive(Default)]
+struct IdentityCache {
+    entries: VecDeque<(CacheKey, Arc<IdentityMaterial>)>,
+    // Only in-flight imports retain a strong reference. Old source IDs do not
+    // accumulate after the operation finishes; unrelated sources stay isolated.
+    generations: HashMap<String, Weak<AtomicU64>>,
+}
+fn identity_cache() -> &'static Mutex<IdentityCache> {
+    static CACHE: OnceLock<Mutex<IdentityCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(IdentityCache::default()))
+}
+fn cached_identity(key: &CacheKey) -> Result<Arc<IdentityMaterial>> {
+    let cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entries
+        .iter()
+        .find(|(entry, _)| entry == key)
+        .map(|(_, identity)| identity.clone())
+        .ok_or_else(|| LOCKED.into())
+}
+fn store_authorized_identity(
+    key: CacheKey,
+    remembers_on_success: bool,
+    load: impl FnOnce() -> Result<IdentityMaterial>,
+) -> Result<Arc<IdentityMaterial>> {
+    let (source_generation, generation) = {
         let mut cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
-        cache.entries.retain(|((id, _), _)| id != source_id);
-        cache.generation = cache.generation.wrapping_add(1);
-    }
-
-    pub(super) fn authorized_identity(
-        config: &SourceConfig,
-        origin: &Url,
-    ) -> Result<Arc<rustls::ClientConfig>> {
-        let key = (config.id.clone(), origin.origin().ascii_serialization());
-        cached_identity(&key)
-    }
-
-    fn cached_identity(key: &CacheKey) -> Result<Arc<rustls::ClientConfig>> {
-        // There is deliberately no Keychain fallback here. A saved checkbox is
-        // a connection preference, not approval to read another app's identity.
-        let cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache
-            .entries
-            .iter()
-            .find(|(entry, _)| entry == key)
-            .map(|(_, tls)| tls.clone())
-            .ok_or_else(|| AUTHORIZATION_REQUIRED.into())
+            .generations
+            .retain(|_, value| value.strong_count() > 0);
+        let source_generation = cache
+            .generations
+            .get(&key.0)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        let generation = source_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        cache
+            .generations
+            .insert(key.0.clone(), Arc::downgrade(&source_generation));
+        (source_generation, generation)
+    };
+    // Never hold the cache lock across file reads, cryptography or an OS dialog.
+    let identity = Arc::new(load()?);
+    let mut cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if source_generation.load(Ordering::Relaxed) != generation {
+        return Err(if remembers_on_success {
+            "Certificate was saved in Cadence Keychain, but this source changed while it was being unlocked. New connections remain locked; unlock the saved certificate again if needed"
+        } else {
+            "Source configuration changed while unlocking the certificate; retry the source"
+        }.into());
     }
-
-    pub(super) fn authorize_identity(
-        config: &SourceConfig,
-        origin: &Url,
-    ) -> Result<Arc<rustls::ClientConfig>> {
-        let key = (config.id.clone(), origin.origin().ascii_serialization());
-        store_authorized_identity(key, existing_identity)
+    cache.entries.retain(|(entry, _)| entry != &key);
+    while cache.entries.len() >= MAX_IDENTITIES {
+        cache.entries.pop_front();
     }
+    cache.entries.push_back((key, identity.clone()));
+    Ok(identity)
+}
 
-    fn store_authorized_identity(
-        key: CacheKey,
-        load: impl FnOnce() -> Result<rustls::ClientConfig>,
-    ) -> Result<Arc<rustls::ClientConfig>> {
-        let generation = {
-            let cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
-            cache.generation
-        };
-        // No lock is held during the OS dialog. A removal while it is open
-        // invalidates this result so a late grant cannot resurrect credentials.
-        let tls = Arc::new(load()?);
-        let mut cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if cache.generation != generation {
-            return Err(
-                "Source configuration changed during certificate authorization; retry the source"
-                    .into(),
-            );
-        }
-        cache.entries.retain(|(entry, _)| entry != &key);
-        while cache.entries.len() >= MAX_IDENTITIES {
-            cache.entries.pop_front();
-        }
-        cache.entries.push_back((key, tls.clone()));
-        Ok(tls)
+fn decode_identity(pkcs12: &[u8], password: &str) -> Result<IdentityMaterial> {
+    if pkcs12.len() > MAX_PKCS12_BYTES || password.len() > MAX_PASSWORD_BYTES {
+        return Err("Certificate or password exceeds the size limit".into());
     }
-
-    #[cfg(test)]
-    #[test]
-    fn certificate_cache_is_scoped_to_source_and_origin_and_forget_revokes_it() {
-        let fixture = || {
-            Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth())
-        };
-        let key = ("tls-cache-test".into(), "https://one.example".into());
-        assert!(cached_identity(&key).is_err());
-        let initial = store_authorized_identity(key.clone(), fixture).unwrap();
-        let cached = cached_identity(&key).unwrap();
-        assert!(Arc::ptr_eq(&initial, &cached));
-        assert!(cached_identity(&("tls-cache-other".into(), key.1.clone())).is_err());
-        let other =
-            store_authorized_identity(("tls-cache-other".into(), key.1.clone()), fixture).unwrap();
-        assert!(!Arc::ptr_eq(&initial, &other));
-        assert!(cached_identity(&(key.0.clone(), "https://two.example".into())).is_err());
-        let other_origin =
-            store_authorized_identity((key.0.clone(), "https://two.example".into()), fixture)
-                .unwrap();
-        assert!(!Arc::ptr_eq(&initial, &other_origin));
-        let refreshed = store_authorized_identity(key.clone(), fixture).unwrap();
-        assert!(!Arc::ptr_eq(&initial, &refreshed));
-        forget_source(&key.0);
-        assert!(cached_identity(&key).is_err());
-        let after_removal = store_authorized_identity(key.clone(), fixture).unwrap();
-        assert!(!Arc::ptr_eq(&refreshed, &after_removal));
-        forget_source(&key.0);
-        forget_source("tls-cache-other");
+    let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict).map_err(
+        |_| "Cannot unlock this PKCS#12 certificate; check the selected file and password",
+    )?;
+    let mut identities = store.entries().filter_map(|(_, entry)| match entry {
+        KeyStoreEntry::PrivateKeyChain(chain) => Some(chain),
+        _ => None,
+    });
+    let identity = identities
+        .next()
+        .ok_or("PKCS#12 contains no matching certificate and private key")?;
+    if identities.next().is_some() {
+        return Err(
+            "PKCS#12 contains multiple identities; choose a file containing one client certificate"
+                .into(),
+        );
     }
-
-    fn existing_identity() -> Result<rustls::ClientConfig> {
-        let pkcs12 = read_item("kanade.p12")?.ok_or(KEYCHAIN_UNAVAILABLE)?;
-        let password = read_item("kanade.p12password")?.unwrap_or_default();
-        let password = std::str::from_utf8(&password).map_err(
-            |_| "KanadeApp certificate password is not valid UTF-8; reconfigure it in KanadeApp",
-        )?;
-        decode_identity(&pkcs12, password)
-    }
-
-    fn read_item(account: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        // This matches KanadeApp's account-only generic-password query. Do not
-        // invent a service identifier or search unrelated identities. This is
-        // reached only through the explicit user authorization action; macOS
-        // owns any access/password prompt. Background paths cannot call it.
-        let results = ItemSearchOptions::new()
-            .class(ItemClass::generic_password())
-            .account(account)
-            .load_data(true)
-            .limit(2)
-            .search();
-        let items = match results {
-            Ok(items) => items,
-            Err(error) if error.code() == -25300 => return Ok(None), // errSecItemNotFound
-            Err(_) => return Err(KEYCHAIN_UNAVAILABLE.into()),
-        };
-        let items = items
-            .into_iter()
-            .map(|item| match item {
-                SearchResult::Data(data) => Ok(Zeroizing::new(data)),
-                _ => Err("KanadeApp certificate setting has an unsupported format".to_owned()),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if items.len() > 1 {
-            return Err("More than one KanadeApp certificate setting matches in Keychain; resolve the duplicate in KanadeApp before retrying".into());
-        }
-        match items.into_iter().next() {
-            Some(data) if data.len() <= 4 * 1024 * 1024 => Ok(Some(data)),
-            None => Ok(None),
-            _ => Err("KanadeApp certificate setting has an unsupported format or size".into()),
-        }
-    }
-
-    pub(super) fn decode_identity(pkcs12: &[u8], password: &str) -> Result<rustls::ClientConfig> {
-        let roots =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        decode_identity_with_roots(pkcs12, password, roots)
-    }
-
-    pub(super) fn decode_identity_with_roots(
-        pkcs12: &[u8],
-        password: &str,
-        roots: rustls::RootCertStore,
-    ) -> Result<rustls::ClientConfig> {
-        let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
-            .map_err(|_| "Cannot unlock the KanadeApp client certificate; check its PKCS#12 file and password in KanadeApp")?;
-        let mut identities = store.entries().filter_map(|(_, entry)| match entry {
-            KeyStoreEntry::PrivateKeyChain(chain) => Some(chain),
-            _ => None,
-        });
-        let identity = identities
-            .next()
-            .ok_or("KanadeApp PKCS#12 contains no matching client certificate and private key")?;
-        if identities.next().is_some() {
-            return Err("KanadeApp PKCS#12 contains multiple identities; configure a single client certificate in KanadeApp".into());
-        }
-        let certificates = identity
+    Ok(IdentityMaterial {
+        certificates: identity
             .certs()
             .iter()
-            .map(|cert| CertificateDer::from(cert.as_der().to_vec()))
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key().as_der().to_vec()));
-        rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| "Cannot configure Kanade TLS protocols")?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(certificates, key)
-        .map_err(|_| {
-            "KanadeApp client certificate and private key are invalid or unsupported".into()
-        })
+            .map(|cert| cert.as_der().to_vec())
+            .collect(),
+        private_key: Zeroizing::new(identity.key().as_der().to_vec()),
+    })
+}
+
+fn validate_identity(identity: &IdentityMaterial) -> Result<()> {
+    #[cfg(not(target_os = "scarlet"))]
+    {
+        tls_config(identity, public_roots()).map(|_| ())
+    }
+    #[cfg(target_os = "scarlet")]
+    {
+        if identity.certificates.is_empty() || identity.private_key.is_empty() {
+            Err("PKCS#12 contains an empty identity".into())
+        } else {
+            Ok(())
+        }
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(not(target_os = "scarlet"))]
+fn public_roots() -> rustls::RootCertStore {
+    rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+}
+#[cfg(not(target_os = "scarlet"))]
+fn tls_config(
+    identity: &IdentityMaterial,
+    roots: rustls::RootCertStore,
+) -> Result<rustls::ClientConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let certificates = identity
+        .certificates
+        .iter()
+        .cloned()
+        .map(CertificateDer::from)
+        .collect();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.to_vec()));
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| "Cannot configure TLS protocols")?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certificates, key)
+        .map_err(|_| "Client certificate and private key are invalid or unsupported".into())
+}
+
+const RECORD_HEADER: &[u8] = b"CadenceIdentity1";
+#[cfg(any(target_os = "macos", test))]
+fn encode_saved_record(pkcs12: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    if pkcs12.len() > MAX_PKCS12_BYTES || password.len() > MAX_PASSWORD_BYTES {
+        return Err("Certificate or password exceeds the size limit".into());
+    }
+    let mut record = Zeroizing::new(Vec::with_capacity(
+        RECORD_HEADER.len() + 4 + pkcs12.len() + password.len(),
+    ));
+    record.extend_from_slice(RECORD_HEADER);
+    record.extend_from_slice(&(pkcs12.len() as u32).to_be_bytes());
+    record.extend_from_slice(pkcs12);
+    record.extend_from_slice(password.as_bytes());
+    Ok(record)
+}
+fn decode_saved_record(record: &[u8]) -> Result<(&[u8], &str)> {
+    let invalid =
+        || "Saved Cadence certificate is invalid; import the certificate again".to_owned();
+    let length_at = RECORD_HEADER.len();
+    if !record.starts_with(RECORD_HEADER) || record.len() < length_at + 4 {
+        return Err(invalid());
+    }
+    let length = u32::from_be_bytes(
+        record[length_at..length_at + 4]
+            .try_into()
+            .map_err(|_| invalid())?,
+    ) as usize;
+    let start = length_at + 4;
+    let end = start.checked_add(length).ok_or_else(invalid)?;
+    if length == 0
+        || length > MAX_PKCS12_BYTES
+        || end > record.len()
+        || record.len() - end > MAX_PASSWORD_BYTES
+    {
+        return Err(invalid());
+    }
+    let password = std::str::from_utf8(&record[end..]).map_err(|_| invalid())?;
+    Ok((&record[start..end], password))
+}
+
+#[cfg(target_os = "macos")]
+mod secure_store {
+    use super::*;
+    use security_framework::{
+        access_control::{ProtectionMode, SecAccessControl},
+        passwords::{self, PasswordOptions},
+    };
+    use sha2::{Digest, Sha256};
+    const SERVICE: &str = "org.scarlet-os.cadence.client-identity";
+    fn account(key: &CacheKey) -> String {
+        // Length-prefix the source ID so delimiters inside either field cannot
+        // make different source/origin pairs share a credential entry.
+        let mut digest = Sha256::new();
+        digest.update((key.0.len() as u64).to_be_bytes());
+        digest.update(key.0.as_bytes());
+        digest.update(key.1.as_bytes());
+        format!("v1:{:x}", digest.finalize())
+    }
+    pub(super) fn save(key: &CacheKey, pkcs12: &[u8], password: &str) -> Result<()> {
+        let record = encode_saved_record(pkcs12, password)?;
+        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
+        options.set_label("Cadence client certificate");
+        options.set_access_synchronized(Some(false));
+        options.set_access_control(
+            SecAccessControl::create_with_protection(
+                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+                0,
+            )
+            .map_err(|_| "Cannot configure Cadence credential protection")?,
+        );
+        passwords::set_generic_password_options(&record, options)
+            .map_err(|_| "Cannot remember this certificate in Cadence's Keychain storage; retry without Remember to use this session only".into())
+    }
+    pub(super) fn load(key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
+        let options = PasswordOptions::new_generic_password(SERVICE, &account(key));
+        let record = Zeroizing::new(passwords::generic_password(options)
+            .map_err(|_| "No accessible saved Cadence certificate for this source; unlock the Keychain or import the selected PKCS#12")?);
+        if record.len() > RECORD_HEADER.len() + 4 + MAX_PKCS12_BYTES + MAX_PASSWORD_BYTES {
+            return Err(
+                "Saved Cadence certificate exceeds the size limit; import the certificate again"
+                    .into(),
+            );
+        }
+        Ok(record)
+    }
+    pub(super) fn remove(key: &CacheKey) -> Result<()> {
+        match passwords::delete_generic_password(SERVICE, &account(key)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == -25300 => Ok(()),
+            Err(_) => Err(
+                "Cannot delete the saved Cadence certificate; unlock the Keychain and retry".into(),
+            ),
+        }
+    }
+    #[test]
+    fn credential_accounts_are_scoped_to_source_and_origin() {
+        assert_ne!(
+            account(&("one".into(), "https://server".into())),
+            account(&("two".into(), "https://server".into()))
+        );
+        assert_ne!(
+            account(&("one".into(), "https://server".into())),
+            account(&("one".into(), "https://other".into()))
+        );
+        assert!(SERVICE.contains("cadence"));
+    }
+}
+#[cfg(not(target_os = "macos"))]
+mod secure_store {
+    use super::*;
+    pub(super) fn save(_: &CacheKey, _: &[u8], _: &str) -> Result<()> {
+        Err("Secure certificate persistence is unavailable on this platform".into())
+    }
+    pub(super) fn load(_: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
+        Err("Unlock the selected PKCS#12 with its password for this session; secure certificate persistence is unavailable on this platform".into())
+    }
+    pub(super) fn remove(_: &CacheKey) -> Result<()> {
+        Err("This platform does not persist client certificates in a secure store".into())
+    }
+}
+
+#[cfg(all(test, not(target_os = "scarlet")))]
 #[path = "kanade_tls_tests.rs"]
 mod mtls_tests;
 
@@ -343,30 +505,91 @@ mod mtls_tests;
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn config(value: serde_json::Value) -> SourceConfig {
+    fn config(id: &str) -> SourceConfig {
         SourceConfig {
-            id: "fixture".into(),
+            id: id.into(),
             name: "Fixture".into(),
             plugin_id: "kanade".into(),
-            settings: value,
+            settings: json!({"url":"https://example.invalid", "client_certificate":true}),
         }
     }
-
     #[test]
-    fn optional_identity_does_not_read_keychain_and_rejects_insecure_endpoints() {
-        assert!(Transport::for_source(&config(json!({"url":"http://localhost"}))).is_ok());
-        assert!(Transport::for_source(&config(json!({"kanade_app_identity":"true"}))).is_err());
-        assert!(identity_origin(&config(json!({"url":"http://localhost"}))).is_err());
-        assert!(identity_origin(&config(json!({"url":"https://user:secret@localhost"}))).is_err());
-        assert_eq!(
-            identity_origin(&config(json!({"url":"wss://localhost:8443/ws"})))
+    fn credentials_are_opt_in_and_legacy_imports_require_migration() {
+        let mut source = config("none");
+        source.settings = json!({"url":"http://localhost"});
+        assert!(Transport::for_source(&source).is_ok());
+        source.settings = json!({"url":"https://localhost", "kanade_app_identity":true});
+        assert!(
+            Transport::for_source(&source)
+                .err()
                 .unwrap()
-                .scheme(),
-            "https"
+                .contains("legacy")
         );
+        source.settings = json!({"url":"http://localhost", "client_certificate":true});
+        assert!(identity_origin(&source).is_err());
+        source.settings = json!({"url":"https://user:secret@localhost", "client_certificate":true});
+        assert!(identity_origin(&source).is_err());
     }
-
+    #[test]
+    fn background_cache_miss_never_reads_file_or_secure_store() {
+        let mut source = config("never-authorized-tls-fixture");
+        source.settings["certificate_path"] = "/path/that/must/not/be/read.p12".into();
+        assert_eq!(Transport::for_source(&source).err().unwrap(), LOCKED);
+    }
+    #[test]
+    fn unlocking_one_source_is_not_invalidated_by_forgetting_another() {
+        let key = ("import-isolated-a".into(), "https://example.invalid".into());
+        let identity = store_authorized_identity(key.clone(), false, || {
+            Transport::forget_source("import-isolated-b");
+            Ok(IdentityMaterial {
+                certificates: vec![],
+                private_key: Zeroizing::new(vec![1]),
+            })
+        })
+        .unwrap();
+        assert!(Arc::ptr_eq(&identity, &cached_identity(&key).unwrap()));
+        Transport::forget_source(&key.0);
+    }
+    #[test]
+    fn forgetting_same_source_rejects_late_unlock_and_reports_completed_persistence() {
+        let key = ("import-revoked".into(), "https://example.invalid".into());
+        for remembered in [false, true] {
+            let error = store_authorized_identity(key.clone(), remembered, || {
+                Transport::forget_source(&key.0);
+                // Simulate the completed native-store save without touching it.
+                Ok(IdentityMaterial {
+                    certificates: vec![],
+                    private_key: Zeroizing::new(vec![1]),
+                })
+            })
+            .err()
+            .unwrap();
+            assert!(cached_identity(&key).is_err());
+            assert_eq!(error.contains("was saved in Cadence Keychain"), remembered);
+        }
+    }
+    #[test]
+    fn portable_identity_import_unlocks_only_the_chosen_source_and_origin() {
+        let source = config("portable-import-fixture");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client.p12");
+        assert!(
+            Transport::import_client_identity(&source, &path, "wrong-password", false).is_err()
+        );
+        assert_eq!(Transport::for_source(&source).err().unwrap(), LOCKED);
+        Transport::import_client_identity(&source, &path, "test-fixture-only", false).unwrap();
+        let origin = identity_origin(&source).unwrap();
+        let identity = cached_identity(&cache_key(&source, &origin)).unwrap();
+        assert!(!identity.private_key.is_empty());
+        #[cfg(not(target_os = "scarlet"))]
+        assert!(Transport::for_source(&source).is_ok());
+        let mut other = source.clone();
+        other.settings["url"] = "https://other.invalid".into();
+        assert_eq!(Transport::for_source(&other).err().unwrap(), LOCKED);
+        other = config("another-source");
+        assert_eq!(Transport::for_source(&other).err().unwrap(), LOCKED);
+        Transport::forget_source(&source.id);
+        assert_eq!(Transport::for_source(&source).err().unwrap(), LOCKED);
+    }
     #[test]
     fn identity_is_never_sent_to_a_different_media_origin() {
         let transport = Transport {
@@ -386,29 +609,33 @@ mod tests {
             assert!(transport.validate_media_url(rejected).is_err());
         }
     }
-
-    #[cfg(target_os = "macos")]
     #[test]
-    fn invalid_identity_errors_do_not_disclose_password_or_contents() {
-        let error = macos::decode_identity(b"private-certificate-data", "private-password")
+    fn invalid_identity_errors_do_not_disclose_password_contents_or_path() {
+        let error = decode_identity(b"private-certificate-data", "private-password")
             .err()
             .unwrap();
         assert!(!error.contains("private-certificate-data"));
         assert!(!error.contains("private-password"));
+        assert!(
+            !read_pkcs12(Path::new("/private/missing-certificate.p12"))
+                .err()
+                .unwrap()
+                .contains("/private")
+        );
     }
-
-    #[cfg(target_os = "macos")]
     #[test]
-    fn background_identity_cache_miss_requires_explicit_user_authorization() {
-        let source = SourceConfig {
-            id: "never-authorized-tls-fixture".into(),
-            name: "Fixture".into(),
-            plugin_id: "kanade".into(),
-            settings: json!({"url":"https://example.invalid", "kanade_app_identity":true}),
-        };
-        // for_source has no path to read_item, even with a saved opt-in flag.
-        let error = Transport::for_source(&source).err().unwrap();
-        assert!(error.contains("Authorize certificate"));
-        assert!(error.contains("this Cadence session"));
+    fn secure_store_record_roundtrip_and_malformed_bounds() {
+        let bytes = b"encrypted-pkcs12-fixture";
+        let record = encode_saved_record(bytes, "fixture-password").unwrap();
+        assert_eq!(
+            decode_saved_record(&record).unwrap(),
+            (bytes.as_slice(), "fixture-password")
+        );
+        assert!(decode_saved_record(&record[..RECORD_HEADER.len() + 3]).is_err());
+        let mut broken = record.to_vec();
+        broken[RECORD_HEADER.len()..RECORD_HEADER.len() + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_saved_record(&broken).is_err());
+        assert!(decode_saved_record(b"unrelated-data").is_err());
     }
 }

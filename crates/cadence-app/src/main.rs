@@ -7,6 +7,7 @@ mod library_folders;
 mod persistence;
 mod playback;
 mod presentation;
+mod secret_field;
 use presentation::*;
 mod transport;
 mod ui;
@@ -63,6 +64,7 @@ struct Cadence {
     effects: Option<EffectPane>,
     startup_effects: Rc<RefCell<Option<cadence_effects::RackConfig>>>,
     effect_picker: Rc<Cell<bool>>,
+    certificate_picker: Rc<Cell<bool>>,
     #[cfg(test)]
     builds: Rc<BuildCounts>,
 }
@@ -90,6 +92,7 @@ impl Cadence {
             effects: None,
             startup_effects: Rc::new(RefCell::new(None)),
             effect_picker: Rc::new(Cell::new(false)),
+            certificate_picker: Rc::new(Cell::new(false)),
             #[cfg(test)]
             builds: Rc::new(BuildCounts::default()),
         }
@@ -134,6 +137,7 @@ impl Cadence {
             dialog.initial_directory = Some(path.into());
         }
         self.effect_picker.set(false);
+        self.certificate_picker.set(false);
         *self.picker.borrow_mut() = Some(dialog.show(owner));
     }
     fn open_effect(&self) {
@@ -154,6 +158,28 @@ impl Cadence {
             extensions: vec!["clap".into()],
         }];
         self.effect_picker.set(true);
+        self.certificate_picker.set(false);
+        *self.picker.borrow_mut() = Some(dialog.show(owner));
+    }
+    fn open_certificate(&self) {
+        if self.picker.borrow().is_some() || self.folder_picker.borrow().is_some() {
+            return;
+        }
+        let Some(owner) = self.owner.get() else {
+            self.workspace
+                .source_status
+                .set("Enter the certificate file path below".into());
+            return;
+        };
+        let mut dialog = FileDialog::new(FileDialogMode::Open);
+        dialog.title = "Choose a client certificate for Cadence".into();
+        dialog.filter_policy = FileDialogFilterPolicy::Optional;
+        dialog.filters = vec![FileDialogFilter {
+            name: "PKCS#12 certificate".into(),
+            extensions: vec!["p12".into(), "pfx".into()],
+        }];
+        self.effect_picker.set(false);
+        self.certificate_picker.set(true);
         *self.picker.borrow_mut() = Some(dialog.show(owner));
     }
     fn import_folder(&self) {
@@ -228,9 +254,16 @@ impl Cadence {
         let result = self.picker.borrow().as_ref().and_then(|p| p.take_result());
         if let Some(result) = result {
             self.picker.borrow_mut().take();
+            let certificate = self.certificate_picker.replace(false);
             match result {
                 Ok(FileDialogOutcome::Selected(paths)) => {
-                    if self.effect_picker.replace(false) {
+                    if certificate {
+                        if let Some(path) = paths.first() {
+                            self.workspace
+                                .certificate_path
+                                .set(PathBuf::from(path.clone()).to_string_lossy().into());
+                        }
+                    } else if self.effect_picker.replace(false) {
                         if let Some(effects) = &self.effects
                             && let Some(path) = paths.first()
                         {
@@ -244,7 +277,11 @@ impl Cadence {
                 }
                 Ok(FileDialogOutcome::Cancelled) => {}
                 Err(FileDialogError::Unsupported(_)) => {
-                    if self.effect_picker.replace(false) {
+                    if certificate {
+                        self.workspace
+                            .source_status
+                            .set("Enter the certificate file path below".into());
+                    } else if self.effect_picker.replace(false) {
                         self.playback.status.set(
                             "Enter a CLAP library path in Effects, then choose Discover".into(),
                         );
@@ -522,9 +559,11 @@ impl Application for Cadence {
     fn on_window_created(
         &mut self,
         context: &WindowContext,
-        _: &mut dyn scarlet_ui::PlatformWindow,
+        window: &mut dyn scarlet_ui::PlatformWindow,
     ) {
         self.owner.set(Some(context.window_id));
+        self.workspace
+            .configure_certificate_clipboard(window.text_clipboard().ok());
     }
     fn on_idle(&mut self) {
         // The runner pumps AppKit on the main thread before its first idle.

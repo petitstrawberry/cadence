@@ -1,7 +1,7 @@
 //! Application-owned catalog/source state. Blocking I/O stays on cancellable workers.
 use crate::{
     Cadence, button, caption,
-    jobs::{LibraryCommand, LibraryWorker, SourceSyncControl},
+    jobs::{IdentityRequest, LibraryCommand, LibraryWorker, SourceSyncControl},
     persistence::{AppConfig, ConfigWriter},
     state, text, truncate,
     ui::*,
@@ -38,6 +38,7 @@ pub enum SourcePage {
     Overview,
     Connect,
     Browse,
+    Certificate,
 }
 
 /// Stable source identity; folder roots and remote providers share navigation.
@@ -98,6 +99,10 @@ pub struct Workspace {
     pub source_url: State<String>,
     pub source_kind: State<usize>,
     source_kanade_identity: State<bool>,
+    pub(crate) certificate_path: State<String>,
+    certificate_secret: crate::secret_field::SecretInput,
+    certificate_remember: State<bool>,
+    certificate_removing: Rc<Cell<bool>>,
     pub source_status: State<String>,
     source_sync: State<Option<String>>,
     source_sync_saving: State<bool>,
@@ -130,6 +135,12 @@ pub struct Workspace {
     save_after: Rc<Cell<Instant>>,
 }
 impl Workspace {
+    pub(crate) fn configure_certificate_clipboard(
+        &self,
+        clipboard: Option<scarlet_ui::clipboard::TextClipboard>,
+    ) {
+        self.certificate_secret.set_clipboard(clipboard);
+    }
     pub fn memory() -> Self {
         Self {
             tab: state(Tab::Albums),
@@ -151,6 +162,10 @@ impl Workspace {
             source_url: state(String::new()),
             source_kind: state(0),
             source_kanade_identity: state(false),
+            certificate_path: state(String::new()),
+            certificate_secret: crate::secret_field::SecretInput::new(),
+            certificate_remember: state(false),
+            certificate_removing: Rc::new(Cell::new(false)),
             source_status: state(String::new()),
             source_sync: state(None),
             source_sync_saving: state(false),
@@ -237,6 +252,7 @@ impl Workspace {
         false
     }
     pub fn cancel(&self) {
+        self.certificate_secret.clear();
         if let Some(worker) = &self.worker {
             worker.cancel_scan();
         }
@@ -273,6 +289,17 @@ impl Workspace {
                 .set("Enter the source address first".into());
             return;
         }
+        let endpoint = if self.source_kind.get() == 1 {
+            match cadence_sources::normalize_kanade_url(&endpoint) {
+                Ok(url) => url,
+                Err(error) => {
+                    self.source_status.set(error);
+                    return;
+                }
+            }
+        } else {
+            endpoint
+        };
         let (plugin_id, settings) = match self.source_kind.get() {
             2 => ("dlna", serde_json::json!({"url":endpoint})),
             3 => (
@@ -281,7 +308,7 @@ impl Workspace {
             ),
             _ => (
                 "kanade",
-                serde_json::json!({"url":endpoint, "kanade_app_identity": cfg!(target_os = "macos") && self.source_kanade_identity.get()}),
+                serde_json::json!({"url":endpoint, "client_certificate": self.source_kanade_identity.get()}),
             ),
         };
         if plugin_id == "process" && !PathBuf::from(&endpoint).is_absolute() {
@@ -341,8 +368,17 @@ impl Workspace {
         self.source_kanade_identity.set(false);
         self.history.borrow_mut().clear();
         self.source_page.set(SourcePage::Browse);
-        self.request_source_sync(&config);
-        self.browse(app, config, None);
+        if config
+            .settings
+            .get("client_certificate")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            self.open_certificate_setup();
+        } else {
+            self.request_source_sync(&config);
+            self.browse(app, config, None);
+        }
     }
     fn remove_selected_source(&self) {
         let Some(provider) = self.source_selection.get() else {
@@ -355,10 +391,10 @@ impl Workspace {
             ProviderId::Remote(id) => Some(id.clone()),
             _ => None,
         };
-        if removing_source
-            .as_ref()
-            .is_some_and(|id| self.pending_removals.borrow().contains(id))
-        {
+        if removing_source.as_ref().is_some_and(|id| {
+            self.pending_removals.borrow().contains(id)
+                || self.source_authorizing.get().as_ref() == Some(id)
+        }) {
             return;
         }
         let command = match provider {
@@ -368,12 +404,14 @@ impl Workspace {
                     return;
                 }
                 self.cancel_source_sync(Some(&id));
-                if self.source_authorizing.get().as_ref() == Some(&id)
-                    && let Some(cancel) = self.authorization_cancel.borrow().as_ref()
-                {
-                    cancel.store(true, Ordering::Release);
+                let credential_config = self.selected_source().filter(|source| {
+                    source.plugin_id == "kanade"
+                        && source.settings.get("certificate_path").is_some()
+                });
+                LibraryCommand::RemoveSource {
+                    source: id,
+                    credential_config,
                 }
-                LibraryCommand::RemoveSource(id)
             }
         };
         if !self.send_library_command(command) {
@@ -422,7 +460,7 @@ impl Workspace {
         }
         let enabled = config
             .settings
-            .get("kanade_app_identity")
+            .get("client_certificate")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let Some(settings) = config.settings.as_object_mut() else {
@@ -430,7 +468,8 @@ impl Workspace {
                 .set("Repair this source's settings before reconnecting".into());
             return;
         };
-        settings.insert("kanade_app_identity".into(), (!enabled).into());
+        settings.remove("kanade_app_identity");
+        settings.insert("client_certificate".into(), (!enabled).into());
         if let Err(error) = SourceRegistry::builtin().validate_config(&config) {
             self.set_sync_status(&config.id, format!("Connection unchanged · {error}"));
             return;
@@ -452,10 +491,29 @@ impl Workspace {
         let parent = self.history.borrow().last().cloned().flatten();
         self.browse(app, config, parent);
     }
-    /// Only this explicit user action may present a native Keychain prompt.
-    /// Adding, restoring, refreshing, and playing sources never call it.
-    fn authorize_kanade_identity(&self) {
+    fn open_certificate_setup(&self) {
         let Some(config) = self
+            .selected_source()
+            .filter(|source| source.plugin_id == "kanade")
+        else {
+            return;
+        };
+        self.certificate_secret.clear();
+        self.certificate_remember.set(false);
+        self.certificate_path.set(
+            config
+                .settings
+                .get("certificate_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .into(),
+        );
+        self.source_status.set(String::new());
+        self.source_page.set(SourcePage::Certificate);
+    }
+    /// Explicit user action; background sync never loads a file or Keychain identity.
+    fn authorize_kanade_identity(&self, saved: bool) {
+        let Some(mut config) = self
             .selected_source()
             .filter(|source| source.plugin_id == "kanade")
         else {
@@ -470,13 +528,53 @@ impl Workspace {
         }
         if config
             .settings
-            .get("kanade_app_identity")
+            .get("client_certificate")
             .and_then(serde_json::Value::as_bool)
             != Some(true)
         {
-            self.set_sync_status(&config.id, "Enable the KanadeApp certificate first".into());
+            self.set_sync_status(&config.id, "Enable the client certificate first".into());
             return;
         }
+        let request = if saved {
+            self.certificate_secret.clear();
+            IdentityRequest::Saved
+        } else {
+            let path = PathBuf::from(self.certificate_path.get().trim());
+            if !path.is_absolute() {
+                self.source_status
+                    .set("Choose a PKCS#12 file or enter its absolute path".into());
+                return;
+            }
+            config.settings["certificate_path"] = path.to_string_lossy().into_owned().into();
+            IdentityRequest::Import {
+                path,
+                password: self.certificate_secret.take(),
+                remember: cfg!(target_os = "macos") && self.certificate_remember.get(),
+            }
+        };
+        self.certificate_removing.set(false);
+        self.begin_identity_request(config, request);
+    }
+    fn remove_saved_certificate(&self) {
+        let Some(config) = self
+            .selected_source()
+            .filter(|source| source.plugin_id == "kanade")
+        else {
+            return;
+        };
+        if !cfg!(target_os = "macos")
+            || self.source_authorizing.get().is_some()
+            || self.pending_removals.borrow().contains(&config.id)
+            || self.read_only.get()
+            || !self.config_writable
+        {
+            return;
+        }
+        self.certificate_secret.clear();
+        self.certificate_removing.set(true);
+        self.begin_identity_request(config, IdentityRequest::RemoveSaved);
+    }
+    fn begin_identity_request(&self, config: SourceConfig, request: IdentityRequest) {
         self.cancel_source_sync(Some(&config.id));
         let cancel = Arc::new(AtomicBool::new(false));
         let result = self
@@ -486,20 +584,30 @@ impl Workspace {
             .and_then(|worker| {
                 worker.send(LibraryCommand::AuthorizeSource {
                     config: config.clone(),
+                    request,
                     cancel: cancel.clone(),
                 })
             });
         match result {
             Ok(()) => {
+                let mut sources = self.sources.get();
+                if let Some(source) = sources.iter_mut().find(|source| source.id == config.id) {
+                    *source = config.clone();
+                }
+                self.sources.set(sources);
+                self.save_sources();
                 self.source_authorizing.set(Some(config.id.clone()));
                 *self.authorization_config.borrow_mut() = Some(config.clone());
                 *self.authorization_cancel.borrow_mut() = Some(cancel);
-                self.set_sync_status(
-                    &config.id,
-                    "Authorize certificate access in the macOS dialog…".into(),
-                );
+                let status = if self.certificate_removing.get() {
+                    "Removing saved certificate…"
+                } else {
+                    "Unlocking client certificate…"
+                };
+                self.source_status.set(status.into());
+                self.set_sync_status(&config.id, status.into());
             }
-            Err(error) => self.set_sync_status(&config.id, error),
+            Err(error) => self.source_status.set(error),
         }
     }
     fn set_sync_status(&self, source: &str, status: String) {
@@ -610,6 +718,7 @@ impl Workspace {
             .find(|source| source.id == id)
     }
     pub fn open_provider(&self, app: &Cadence, provider: ProviderId) {
+        self.certificate_secret.clear();
         self.cancel_network();
         self.active_source.borrow_mut().take();
         self.history.borrow_mut().clear();
@@ -923,6 +1032,10 @@ impl Workspace {
         });
     }
     pub fn poll(&self, app: &Cadence) {
+        if self.tab.get() != Tab::Sources || self.source_page.get() != SourcePage::Certificate {
+            self.certificate_secret.clear();
+        }
+        self.certificate_secret.poll();
         if self.dirty.get()
             && self.config_writable
             && Instant::now() >= self.save_after.get()
@@ -962,12 +1075,21 @@ impl Workspace {
                 }
                 if let Some(source) = &event.authorized_source {
                     let requested = self.authorization_config.borrow_mut().take();
+                    let removing = self.certificate_removing.replace(false);
                     self.source_authorizing.set(None);
                     self.authorization_cancel.borrow_mut().take();
                     if let Some(error) = &event.error {
+                        self.source_status.set(error.clone());
                         self.set_sync_status(
                             source,
-                            format!("Certificate authorization failed · {error}"),
+                            format!("Certificate operation failed · {error}"),
+                        );
+                    } else if removing {
+                        self.source_status
+                            .set("Saved certificate removed; new connections locked".into());
+                        self.set_sync_status(
+                            source,
+                            "Saved certificate removed; new connections locked".into(),
                         );
                     } else if let Some(config) = requested
                         && !self.pending_removals.borrow().contains(source)
@@ -975,8 +1097,10 @@ impl Workspace {
                             current.id == config.id && current.settings == config.settings
                         })
                     {
+                        self.certificate_secret.clear();
                         self.request_source_sync(&config);
                         if self.source_selection.get() == Some(ProviderId::Remote(source.clone())) {
+                            self.source_page.set(SourcePage::Browse);
                             let parent = self.history.borrow().last().cloned().flatten();
                             self.browse(app, config, parent);
                         }
@@ -1385,6 +1509,7 @@ impl SourcesPane {
             SourcePage::Overview => self.overview(),
             SourcePage::Connect => self.connect(),
             SourcePage::Browse => self.browse(),
+            SourcePage::Certificate => self.certificate(),
         }
     }
     fn heading(&self, title: &str, detail: String, actions: AnyView) -> AnyView {
@@ -1458,10 +1583,10 @@ impl SourcesPane {
                 TextField::new(workspace.source_url.clone()).placeholder(match workspace.source_kind.get() {
                     2 => "DLNA device description URL", 3 => "Absolute path to the source plugin executable", _ => "Kanade server URL",
                 }).font_size(13.).padding(8.).on_key(|_| true).frame(form_width,36.),
-                if cfg!(target_os = "macos") && workspace.source_kind.get() == 1 {
+                if workspace.source_kind.get() == 1 {
                     AnyView::new(hstack! {
                         Toggle::new(workspace.source_kanade_identity.clone()).frame(36.,22.),
-                        caption("Use KanadeApp client certificate").alignment(Alignment::Leading).frame(form_width - 48.,32.),
+                        caption("Use a client certificate").alignment(Alignment::Leading).frame(form_width - 48.,32.),
                     }.spacing(12.).frame(form_width,32.))
                 } else { AnyView::new(Spacer::new().frame(0.,0.)) },
                 button("Connect").icon(Icon::Network).on_click(move || connect.workspace.add_source(&connect)).frame(110.,32.)
@@ -1476,6 +1601,58 @@ impl SourcesPane {
                 setup,
                 Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
                     .alignment(Alignment::Leading).frame(form_width,36.),
+            }.spacing(10.).padding(20.).alignment(Alignment::TopLeading).frame(width,self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE),
+        }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
+    }
+    fn certificate(&self) -> AnyView {
+        let workspace = &self.app.workspace;
+        let width = self.width;
+        let form_width = (width - 40.).min(560.);
+        let back = workspace.clone();
+        let choose = self.app.clone();
+        let unlock = workspace.clone();
+        let saved = workspace.clone();
+        let forget = workspace.clone();
+        let busy = workspace.source_authorizing.get().is_some();
+        let actions = if busy {
+            AnyView::new(caption("Certificate operation in progress…").frame(form_width, 36.))
+        } else {
+            AnyView::new(vstack! {
+                button("Unlock and connect").on_click(move || unlock.authorize_kanade_identity(false)).frame(180.,32.)
+                    .alignment(Alignment::Leading).frame(form_width,36.),
+                if cfg!(target_os = "macos") {
+                    AnyView::new(hstack! {
+                        button("Unlock saved certificate").header_style().on_click(move || saved.authorize_kanade_identity(true)).frame(200.,32.),
+                        button("Delete saved certificate").header_style().on_click(move || forget.remove_saved_certificate()).frame(200.,32.),
+                    }.spacing(8.).alignment(Alignment::Leading).frame(form_width,36.))
+                } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+            }.spacing(8.))
+        };
+        AnyView::new(Surface::new(vstack! {
+            back_header("Client certificate",AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || {
+                back.certificate_secret.clear();
+                back.source_page.set(SourcePage::Browse);
+            }),
+            vstack! {
+                caption("Choose your PKCS#12 (.p12 or .pfx) certificate.").alignment(Alignment::Leading).frame(form_width,24.),
+                hstack! {
+                    TextField::new(workspace.certificate_path.clone()).placeholder("Certificate file path").font_size(13.).padding(8.).on_key(|_| true).frame(form_width-132.,36.),
+                    button("Choose file…").on_click(move || choose.open_certificate()).frame(120.,32.),
+                }.spacing(12.).frame(form_width,36.),
+                caption("Certificate password").alignment(Alignment::Leading).frame(form_width,20.),
+                workspace.certificate_secret.view(form_width),
+                if cfg!(target_os = "macos") {
+                    AnyView::new(hstack! {
+                        Toggle::new(workspace.certificate_remember.clone()).frame(36.,22.),
+                        caption("Save in Cadence's Keychain storage").alignment(Alignment::Leading).frame(form_width-48.,32.),
+                    }.spacing(12.).frame(form_width,32.))
+                } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+                caption(if workspace.certificate_remember.get() && cfg!(target_os = "macos") {
+                    "The certificate and password will be stored securely for Cadence."
+                } else { "The password stays in memory for this session only." }).alignment(Alignment::Leading).frame(form_width,28.),
+                actions,
+                Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
+                    .alignment(Alignment::Leading).frame(form_width,60.).clip(),
             }.spacing(10.).padding(20.).alignment(Alignment::TopLeading).frame(width,self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE),
         }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
     }
@@ -1498,11 +1675,11 @@ impl SourcesPane {
             .selected_source()
             .and_then(|source| workspace.sync_statuses.get().get(&source.id).cloned())
             .unwrap_or_default();
-        let identity_controls = cfg!(target_os = "macos") && kanade;
+        let identity_controls = kanade;
         let identity_enabled = workspace.selected_source().is_some_and(|source| {
             source
                 .settings
-                .get("kanade_app_identity")
+                .get("client_certificate")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         });
@@ -1602,7 +1779,10 @@ impl SourcesPane {
                     .frame(100., 32.),
             )
         };
-        let remove_action = if workspace.read_only.get() || workspace.folders.busy.get() {
+        let remove_action = if workspace.read_only.get()
+            || workspace.folders.busy.get()
+            || workspace.source_authorizing.get().is_some()
+        {
             AnyView::new(Spacer::new().frame(0., 32.))
         } else {
             AnyView::new(
@@ -1619,7 +1799,7 @@ impl SourcesPane {
             let enabled = workspace.selected_source().is_some_and(|source| {
                 source
                     .settings
-                    .get("kanade_app_identity")
+                    .get("client_certificate")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
             });
@@ -1630,9 +1810,9 @@ impl SourcesPane {
             {
                 AnyView::new(
                     button(if enabled {
-                        "KanadeApp certificate: On"
+                        "Client certificate: On"
                     } else {
-                        "KanadeApp certificate: Off"
+                        "Client certificate: Off"
                     })
                     .header_style()
                     .on_click(move || reconnect.workspace.toggle_kanade_identity(&reconnect))
@@ -1644,9 +1824,9 @@ impl SourcesPane {
             } else {
                 AnyView::new(
                     caption(if enabled {
-                        "KanadeApp certificate: On"
+                        "Client certificate: On"
                     } else {
-                        "KanadeApp certificate: Off"
+                        "Client certificate: Off"
                     })
                     .alignment(Alignment::Leading)
                     .padding_insets(EdgeInsets::horizontal(20.))
@@ -1667,9 +1847,9 @@ impl SourcesPane {
             } else if workspace.config_writable && !workspace.read_only.get() {
                 let authorize = workspace.clone();
                 AnyView::new(
-                    button("Authorize certificate…")
+                    button("Set up / unlock certificate…")
                         .header_style()
-                        .on_click(move || authorize.authorize_kanade_identity())
+                        .on_click(move || authorize.open_certificate_setup())
                         .frame(240., 28.)
                         .alignment(Alignment::Leading)
                         .padding_insets(EdgeInsets::horizontal(20.))
@@ -1723,9 +1903,9 @@ impl SourcesPane {
         };
         AnyView::new(Surface::new(vstack! {
             back_header(&title,AnyView::new(hstack! { refresh, remove_action }.spacing(8.)),220.,width,move || back.workspace.back_in_source(&back)),
-            Text::from_state(workspace.source_status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()).alignment(Alignment::Leading)
-                .padding_insets(EdgeInsets::horizontal(20.)).frame(width,28.),
-            if kanade { AnyView::new(caption(sync_status).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(20.)).frame(width,24.)) } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+            caption(truncate(&workspace.source_status.get(), ((width - 40.) / 6.5).max(1.) as usize)).font_size(11.).alignment(Alignment::Leading)
+                .padding_insets(EdgeInsets::horizontal(20.)).frame(width,28.).clip(),
+            if kanade { AnyView::new(caption(truncate(&sync_status, ((width - 40.) / 6.5).max(1.) as usize)).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(20.)).frame(width,24.).clip()) } else { AnyView::new(Spacer::new().frame(0.,0.)) },
             identity_control,
             authorization_control,
             activity,
@@ -1748,9 +1928,11 @@ impl View for SourcesPane {
             &workspace.source_selection,
             &workspace.source_kind,
             &workspace.source_page,
+            &workspace.source_status,
             &workspace.source_sync,
             &workspace.source_sync_saving,
             &workspace.source_authorizing,
+            &workspace.certificate_remember,
             &workspace.sync_statuses,
             &workspace.roots,
             &workspace.library,
@@ -1864,6 +2046,60 @@ mod tests {
         release
     }
     #[test]
+    fn entered_kanade_hostname_is_normalized_before_saving_the_source() {
+        let app = app();
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        workspace.source_kind.set(1);
+        workspace.source_url.set("kanade.ichigo.dev".into());
+        let release = hold_network(&workspace);
+        workspace.add_source(&app);
+        assert_eq!(workspace.sources.get().len(), 1);
+        assert_eq!(
+            workspace.sources.get()[0].settings["url"],
+            "https://kanade.ichigo.dev/"
+        );
+        assert_eq!(
+            workspace.config.borrow().sources[0].settings["url"],
+            "https://kanade.ichigo.dev/"
+        );
+        workspace
+            .source_url
+            .set("https://user:secret@example.com".into());
+        workspace.add_source(&app);
+        assert_eq!(workspace.sources.get().len(), 1);
+        assert!(workspace.source_status.get().contains("Credentials"));
+        workspace.cancel();
+        release.send(()).unwrap();
+        workspace
+            .network
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .handle
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn certificate_source_opens_standalone_setup_without_reading_credentials() {
+        let app = app();
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        workspace.source_kind.set(1);
+        workspace.source_url.set("kanade.example.com".into());
+        workspace.source_kanade_identity.set(true);
+        workspace.add_source(&app);
+        assert!(workspace.source_page.get() == SourcePage::Certificate);
+        assert!(workspace.source_authorizing.get().is_none());
+        assert!(workspace.pending_sync.borrow().is_empty());
+        assert!(workspace.network.borrow().is_none());
+        let config = &workspace.config.borrow().sources[0];
+        assert_eq!(config.settings["client_certificate"], true);
+        assert!(config.settings.get("kanade_app_identity").is_none());
+        assert!(config.settings.get("password").is_none());
+        assert!(!workspace.certificate_remember.get());
+    }
+    #[test]
     fn kanade_sync_is_queued_once_and_read_only_sources_are_not_synced() {
         let mut workspace = Workspace::memory();
         workspace.config_writable = true;
@@ -1891,7 +2127,7 @@ mod tests {
         workspace
             .source_selection
             .set(Some(ProviderId::Remote("unapproved".into())));
-        workspace.authorize_kanade_identity();
+        workspace.authorize_kanade_identity(true);
         assert!(workspace.source_authorizing.get().is_none());
         assert!(workspace.authorization_config.borrow().is_none());
         assert!(workspace.sync_statuses.get()["unapproved"].contains("Enable"));
@@ -1932,14 +2168,14 @@ mod tests {
         workspace.toggle_kanade_identity(&app);
         assert_eq!(workspace.sources.get()[0].id, "existing");
         assert_eq!(
-            workspace.sources.get()[0].settings["kanade_app_identity"],
+            workspace.sources.get()[0].settings["client_certificate"],
             true
         );
         assert_eq!(workspace.pending_sync.borrow().len(), 1);
         assert!(workspace.dirty.get());
         workspace.toggle_kanade_identity(&app);
         assert_eq!(
-            workspace.sources.get()[0].settings["kanade_app_identity"],
+            workspace.sources.get()[0].settings["client_certificate"],
             false
         );
         assert_eq!(workspace.pending_sync.borrow().len(), 1);
