@@ -9,5 +9,9 @@ use clientAuth and serverAuth respectively; the server SAN is localhost and
 127.0.0.1. They were generated on 2026-10-28 with a 36500-day validity period so
 tests do not expire during normal development. `client.p12` contains its client
 private key, leaf certificate and root certificate. `server-key.der` is PKCS#8.
+`client-v1.p12` is a separate self-signed synthetic X.509 v1 client identity;
+its password is `synthetic-test-only`. It is not trusted outside tests.
+`client-nested.p12` contains the same synthetic identity in a nested
+safeContentsBag, without encryption or a MAC, to document unsupported nesting.
 
 The tests never read or write Keychain and never contact a non-loopback server.

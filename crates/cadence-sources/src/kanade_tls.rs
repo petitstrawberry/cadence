@@ -418,6 +418,39 @@ fn tls_config(
         .map(CertificateDer::from)
         .collect();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.to_vec()));
+    // rustls uses webpki to parse the *local* client certificate when it
+    // checks key consistency; webpki rejects X.509 v1. For a v1 client
+    // identity, parse the certificate with x509-parser and compare its full
+    // SubjectPublicKeyInfo against the TLS provider's derived public key.
+    // This only affects local identity selection: server certificates still
+    // use the normal rustls verifier and the server validates the client.
+    let leaf = identity
+        .certificates
+        .first()
+        .ok_or("The client certificate is missing")?;
+    let (trailing, parsed) = x509_parser::parse_x509_certificate(leaf)
+        .map_err(|_| "The client certificate cannot be parsed")?;
+    if !trailing.is_empty() {
+        return Err("The client certificate contains trailing data".into());
+    }
+    if parsed.version().0 == 0 {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let signing_key = provider.key_provider.load_private_key(key).map_err(
+            |_| "The private key format or algorithm is not supported by Cadence's TLS provider",
+        )?;
+        let public_key = signing_key
+            .public_key()
+            .ok_or("Cannot verify that the client certificate matches its private key")?;
+        if public_key.as_ref() != parsed.public_key().raw {
+            return Err("The client certificate does not match its private key; choose a PKCS#12 with the matching pair".into());
+        }
+        let certified = rustls::sign::CertifiedKey::new(certificates, signing_key);
+        return Ok(rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| "Cannot configure TLS protocols")?
+            .with_root_certificates(roots)
+            .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified))));
+    }
     rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|_| "Cannot configure TLS protocols")?
@@ -798,6 +831,70 @@ mod tests {
             validate_identity(&identity)
                 .unwrap_err()
                 .contains("private key format or algorithm")
+        );
+    }
+    #[test]
+    fn legacy_v1_certificate_is_accepted_as_a_client_identity() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client-v1.p12");
+        let identity =
+            decode_identity(&std::fs::read(path).unwrap(), "synthetic-test-only").unwrap();
+        assert!(validate_identity(&identity).is_ok());
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    #[test]
+    fn pkcs12_certificate_bags_yield_leaf_first_der_and_not_pem() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls");
+        // This OpenSSL fixture puts certificate bags before the shrouded key,
+        // with the leaf and its CA in separate bags.
+        let pkcs12 = std::fs::read(fixture.join("client.p12")).unwrap();
+        let identity = decode_identity(&pkcs12, "test-fixture-only").unwrap();
+        assert_eq!(identity.certificates.len(), 2);
+        assert_eq!(
+            identity.certificates[1],
+            std::fs::read(fixture.join("root.der")).unwrap()
+        );
+        for cert in &identity.certificates {
+            let (remaining, _) = x509_parser::parse_x509_certificate(cert).unwrap();
+            assert!(remaining.is_empty());
+            assert!(!cert.starts_with(b"-----BEGIN"));
+        }
+        assert!(validate_identity(&identity).is_ok());
+        assert!(
+            decode_identity(
+                b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----",
+                ""
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn nested_safe_contents_are_currently_not_supported() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client-nested.p12");
+        let error = decode_identity(&std::fs::read(path).unwrap(), "synthetic-test-only")
+            .err()
+            .unwrap();
+        assert!(error.contains("no matching certificate and private key"));
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    #[test]
+    fn legacy_v1_certificate_still_rejects_a_different_private_key() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls");
+        let mut identity = decode_identity(
+            &std::fs::read(fixture.join("client-v1.p12")).unwrap(),
+            "synthetic-test-only",
+        )
+        .unwrap();
+        let other = decode_identity(
+            &std::fs::read(fixture.join("client.p12")).unwrap(),
+            "test-fixture-only",
+        )
+        .unwrap();
+        identity.private_key = other.private_key;
+        assert!(
+            validate_identity(&identity)
+                .unwrap_err()
+                .contains("does not match")
         );
     }
     #[test]
