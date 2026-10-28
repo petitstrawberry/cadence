@@ -1,7 +1,7 @@
 //! Application-owned catalog/source state. Blocking I/O stays on cancellable workers.
 use crate::{
     Cadence, button, caption,
-    jobs::{LibraryCommand, LibraryWorker},
+    jobs::{LibraryCommand, LibraryWorker, SourceSyncControl},
     persistence::{AppConfig, ConfigWriter},
     state, text, truncate,
     ui::*,
@@ -13,7 +13,7 @@ use scarlet_ui::{hstack, prelude::*, views::BitmapImage, vstack};
 use std::{
     any::Any,
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -97,7 +97,18 @@ pub struct Workspace {
     pub source_name: State<String>,
     pub source_url: State<String>,
     pub source_kind: State<usize>,
+    source_kanade_identity: State<bool>,
     pub source_status: State<String>,
+    source_sync: State<Option<String>>,
+    source_sync_saving: State<bool>,
+    source_authorizing: State<Option<String>>,
+    authorization_config: Rc<RefCell<Option<SourceConfig>>>,
+    authorization_cancel: Rc<RefCell<Option<Arc<AtomicBool>>>>,
+    sync_statuses: State<HashMap<String, String>>,
+    sync_control: Rc<RefCell<Option<Arc<SourceSyncControl>>>>,
+    pending_sync: Rc<RefCell<VecDeque<String>>>,
+    startup_sync: Rc<Cell<bool>>,
+    pending_removals: Rc<RefCell<HashSet<String>>>,
     pub warning: State<String>,
     history: Rc<RefCell<Vec<Option<String>>>>,
     folder_titles: Rc<RefCell<HashMap<String, String>>>,
@@ -139,7 +150,18 @@ impl Workspace {
             source_name: state(String::new()),
             source_url: state(String::new()),
             source_kind: state(0),
+            source_kanade_identity: state(false),
             source_status: state(String::new()),
+            source_sync: state(None),
+            source_sync_saving: state(false),
+            source_authorizing: state(None),
+            authorization_config: Rc::new(RefCell::new(None)),
+            authorization_cancel: Rc::new(RefCell::new(None)),
+            sync_statuses: state(HashMap::new()),
+            sync_control: Rc::new(RefCell::new(None)),
+            pending_sync: Rc::new(RefCell::new(VecDeque::new())),
+            startup_sync: Rc::new(Cell::new(false)),
+            pending_removals: Rc::new(RefCell::new(HashSet::new())),
             warning: state(String::new()),
             history: Rc::new(RefCell::new(vec![])),
             folder_titles: Rc::new(RefCell::new(HashMap::new())),
@@ -173,6 +195,7 @@ impl Workspace {
             loaded.writable,
         )));
         this.directory = directory;
+        this.startup_sync.set(true);
         this
     }
     pub fn media_cache_directory(&self) -> PathBuf {
@@ -218,6 +241,10 @@ impl Workspace {
             worker.cancel_scan();
         }
         self.cancel_network();
+        self.cancel_source_sync(None);
+        if let Some(cancel) = self.authorization_cancel.borrow().as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
         self.source_status.set("Cancelled".into());
     }
     pub fn shutdown(&self) {
@@ -252,7 +279,10 @@ impl Workspace {
                 "process",
                 serde_json::json!({"executable":endpoint,"args":[]}),
             ),
-            _ => ("kanade", serde_json::json!({"url":endpoint})),
+            _ => (
+                "kanade",
+                serde_json::json!({"url":endpoint, "kanade_app_identity": cfg!(target_os = "macos") && self.source_kanade_identity.get()}),
+            ),
         };
         if plugin_id == "process" && !PathBuf::from(&endpoint).is_absolute() {
             self.source_status
@@ -291,6 +321,15 @@ impl Workspace {
             plugin_id: plugin_id.into(),
             settings,
         };
+        if let Err(error) = SourceRegistry::builtin().validate_config(&config) {
+            self.source_status.set(error);
+            return;
+        }
+        if !self.config_writable {
+            self.source_status
+                .set("Repair the app settings and restart before adding a source".into());
+            return;
+        }
         sources.push(config.clone());
         self.folder_titles.borrow_mut().clear();
         self.source_selection
@@ -299,8 +338,10 @@ impl Workspace {
         self.save_sources();
         self.source_url.set(String::new());
         self.source_name.set(String::new());
+        self.source_kanade_identity.set(false);
         self.history.borrow_mut().clear();
         self.source_page.set(SourcePage::Browse);
+        self.request_source_sync(&config);
         self.browse(app, config, None);
     }
     fn remove_selected_source(&self) {
@@ -310,11 +351,27 @@ impl Workspace {
         if self.read_only.get() || self.folders.busy.get() {
             return;
         }
+        let removing_source = match &provider {
+            ProviderId::Remote(id) => Some(id.clone()),
+            _ => None,
+        };
+        if removing_source
+            .as_ref()
+            .is_some_and(|id| self.pending_removals.borrow().contains(id))
+        {
+            return;
+        }
         let command = match provider {
             ProviderId::Local(path) => LibraryCommand::RemoveRoot(path),
             ProviderId::Remote(id) => {
                 if !self.config_writable {
                     return;
+                }
+                self.cancel_source_sync(Some(&id));
+                if self.source_authorizing.get().as_ref() == Some(&id)
+                    && let Some(cancel) = self.authorization_cancel.borrow().as_ref()
+                {
+                    cancel.store(true, Ordering::Release);
                 }
                 LibraryCommand::RemoveSource(id)
             }
@@ -322,6 +379,9 @@ impl Workspace {
         if !self.send_library_command(command) {
             self.source_status.set(self.library_status.get());
             return;
+        }
+        if let Some(id) = removing_source {
+            self.pending_removals.borrow_mut().insert(id);
         }
         self.cancel_network();
         self.active_source.borrow_mut().take();
@@ -332,6 +392,213 @@ impl Workspace {
         self.source_status
             .set("Removing source and its library songs…".into());
         self.source_page.set(SourcePage::Overview);
+    }
+    fn toggle_kanade_identity(&self, app: &Cadence) {
+        let Some(mut config) = self
+            .selected_source()
+            .filter(|source| source.plugin_id == "kanade")
+        else {
+            return;
+        };
+        if self.pending_removals.borrow().contains(&config.id)
+            || self.source_authorizing.get().as_ref() == Some(&config.id)
+            || !self.config_writable
+            || self.read_only.get()
+        {
+            return;
+        }
+        if self.source_sync.get().as_ref() == Some(&config.id)
+            && self
+                .sync_control
+                .borrow()
+                .as_ref()
+                .is_some_and(|control| control.is_saving())
+        {
+            self.set_sync_status(
+                &config.id,
+                "Wait for the library save before changing the connection".into(),
+            );
+            return;
+        }
+        let enabled = config
+            .settings
+            .get("kanade_app_identity")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let Some(settings) = config.settings.as_object_mut() else {
+            self.source_status
+                .set("Repair this source's settings before reconnecting".into());
+            return;
+        };
+        settings.insert("kanade_app_identity".into(), (!enabled).into());
+        if let Err(error) = SourceRegistry::builtin().validate_config(&config) {
+            self.set_sync_status(&config.id, format!("Connection unchanged · {error}"));
+            return;
+        }
+        self.cancel_source_sync(Some(&config.id));
+        if enabled {
+            SourceRegistry::builtin().forget_source_identity(&config.id);
+        }
+        let mut sources = self.sources.get();
+        if let Some(source) = sources.iter_mut().find(|source| source.id == config.id) {
+            *source = config.clone();
+        }
+        self.sources.set(sources);
+        self.save_sources();
+        // The previous request may still be unwinding. Keep one retry behind
+        // it; polling resolves the current config rather than a stale copy.
+        self.pending_sync.borrow_mut().push_back(config.id.clone());
+        self.set_sync_status(&config.id, "Reconnecting and syncing library…".into());
+        let parent = self.history.borrow().last().cloned().flatten();
+        self.browse(app, config, parent);
+    }
+    /// Only this explicit user action may present a native Keychain prompt.
+    /// Adding, restoring, refreshing, and playing sources never call it.
+    fn authorize_kanade_identity(&self) {
+        let Some(config) = self
+            .selected_source()
+            .filter(|source| source.plugin_id == "kanade")
+        else {
+            return;
+        };
+        if self.pending_removals.borrow().contains(&config.id)
+            || self.source_authorizing.get().is_some()
+            || self.read_only.get()
+            || !self.config_writable
+        {
+            return;
+        }
+        if config
+            .settings
+            .get("kanade_app_identity")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            self.set_sync_status(&config.id, "Enable the KanadeApp certificate first".into());
+            return;
+        }
+        self.cancel_source_sync(Some(&config.id));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = self
+            .worker
+            .as_ref()
+            .ok_or_else(|| "Library storage is unavailable".to_owned())
+            .and_then(|worker| {
+                worker.send(LibraryCommand::AuthorizeSource {
+                    config: config.clone(),
+                    cancel: cancel.clone(),
+                })
+            });
+        match result {
+            Ok(()) => {
+                self.source_authorizing.set(Some(config.id.clone()));
+                *self.authorization_config.borrow_mut() = Some(config.clone());
+                *self.authorization_cancel.borrow_mut() = Some(cancel);
+                self.set_sync_status(
+                    &config.id,
+                    "Authorize certificate access in the macOS dialog…".into(),
+                );
+            }
+            Err(error) => self.set_sync_status(&config.id, error),
+        }
+    }
+    fn set_sync_status(&self, source: &str, status: String) {
+        let mut statuses = self.sync_statuses.get();
+        if statuses.get(source) != Some(&status) {
+            statuses.insert(source.to_owned(), status);
+            self.sync_statuses.set(statuses);
+        }
+    }
+    fn request_source_sync(&self, config: &SourceConfig) {
+        if config.plugin_id != "kanade"
+            || self.pending_removals.borrow().contains(&config.id)
+            || self.source_authorizing.get().as_ref() == Some(&config.id)
+        {
+            return;
+        }
+        if self.read_only.get() || !self.config_writable {
+            self.set_sync_status(&config.id, "Library is read-only · Sync unavailable".into());
+            return;
+        }
+        if self.source_sync.get().as_ref() == Some(&config.id)
+            || self.pending_sync.borrow().contains(&config.id)
+        {
+            return;
+        }
+        self.pending_sync.borrow_mut().push_back(config.id.clone());
+        self.set_sync_status(&config.id, "Waiting to sync library…".into());
+    }
+    fn cancel_source_sync(&self, source: Option<&str>) {
+        self.pending_sync
+            .borrow_mut()
+            .retain(|id| source.is_some_and(|source| source != id));
+        if let Some(active) = self.source_sync.get()
+            && source.is_none_or(|source| source == active)
+            && let Some(control) = self.sync_control.borrow().as_ref()
+        {
+            if control.cancel() {
+                self.set_sync_status(&active, "Cancelling sync…".into());
+            } else {
+                self.set_sync_status(&active, "Saving library…".into());
+            }
+        }
+    }
+    fn poll_source_sync(&self) {
+        if let Some(active) = self.source_sync.get() {
+            let saving = self
+                .sync_control
+                .borrow()
+                .as_ref()
+                .is_some_and(|control| control.is_saving());
+            if saving != self.source_sync_saving.get() {
+                self.source_sync_saving.set(saving);
+                if saving {
+                    self.set_sync_status(&active, "Saving library…".into());
+                    self.library_status.set("Saving synced library…".into());
+                }
+            }
+            return;
+        }
+        let Some(id) = self.pending_sync.borrow_mut().pop_front() else {
+            return;
+        };
+        if self.pending_removals.borrow().contains(&id) {
+            return;
+        }
+        let Some(config) = self
+            .sources
+            .get()
+            .into_iter()
+            .find(|config| config.id == id)
+        else {
+            return;
+        };
+        if self.read_only.get() || !self.config_writable {
+            self.set_sync_status(&id, "Library is read-only · Sync unavailable".into());
+            return;
+        }
+        let control = Arc::new(SourceSyncControl::default());
+        let name = config.name.clone();
+        let result = self
+            .worker
+            .as_ref()
+            .ok_or_else(|| "Library storage is unavailable".to_owned())
+            .and_then(|worker| {
+                worker.send(LibraryCommand::SyncSource {
+                    config,
+                    control: control.clone(),
+                })
+            });
+        match result {
+            Ok(()) => {
+                self.source_sync.set(Some(id.clone()));
+                self.source_sync_saving.set(false);
+                *self.sync_control.borrow_mut() = Some(control);
+                self.set_sync_status(&id, "Syncing library…".into());
+                self.library_status.set(format!("Syncing {name} library…"));
+            }
+            Err(error) => self.set_sync_status(&id, error),
+        }
     }
     fn selected_source(&self) -> Option<SourceConfig> {
         let ProviderId::Remote(id) = self.source_selection.get()? else {
@@ -690,6 +957,46 @@ impl Workspace {
                     self.sources.set(sources);
                     self.save_sources();
                 }
+                if let Some(source) = &event.source_removal {
+                    self.pending_removals.borrow_mut().remove(source);
+                }
+                if let Some(source) = &event.authorized_source {
+                    let requested = self.authorization_config.borrow_mut().take();
+                    self.source_authorizing.set(None);
+                    self.authorization_cancel.borrow_mut().take();
+                    if let Some(error) = &event.error {
+                        self.set_sync_status(
+                            source,
+                            format!("Certificate authorization failed · {error}"),
+                        );
+                    } else if let Some(config) = requested
+                        && !self.pending_removals.borrow().contains(source)
+                        && self.sources.get().iter().any(|current| {
+                            current.id == config.id && current.settings == config.settings
+                        })
+                    {
+                        self.request_source_sync(&config);
+                        if self.source_selection.get() == Some(ProviderId::Remote(source.clone())) {
+                            let parent = self.history.borrow().last().cloned().flatten();
+                            self.browse(app, config, parent);
+                        }
+                    }
+                }
+                if let Some(source) = &event.synced_source {
+                    self.set_sync_status(
+                        source,
+                        event
+                            .error
+                            .as_ref()
+                            .map(|error| format!("Sync failed · Library unchanged · {error}"))
+                            .unwrap_or_else(|| event.status.clone()),
+                    );
+                    if self.source_sync.get().as_ref() == Some(source) {
+                        self.source_sync.set(None);
+                        self.source_sync_saving.set(false);
+                        self.sync_control.borrow_mut().take();
+                    }
+                }
                 if self.read_only.get() != event.read_only {
                     self.read_only.set(event.read_only);
                 }
@@ -712,8 +1019,21 @@ impl Workspace {
                         self.populate_local_source(&root, parent.as_deref());
                     }
                 }
+                if self.startup_sync.replace(false) && !event.read_only {
+                    for source in self.sources.get() {
+                        if !self
+                            .library
+                            .get()
+                            .iter()
+                            .any(|track| track.source_id == source.id)
+                        {
+                            self.request_source_sync(&source);
+                        }
+                    }
+                }
             }
         }
+        self.poll_source_sync();
         if *self.last_query.borrow() != self.query.get() {
             self.filter();
         }
@@ -836,10 +1156,11 @@ impl Workspace {
             .filter(|track| {
                 query.is_empty()
                     || format!(
-                        "{} {} {}",
+                        "{} {} {} {}",
                         track.title,
                         track.artist.as_deref().unwrap_or(""),
-                        track.album.as_deref().unwrap_or("")
+                        track.album.as_deref().unwrap_or(""),
+                        track.album_artist.as_deref().unwrap_or("")
                     )
                     .to_lowercase()
                     .contains(&query)
@@ -1079,9 +1400,11 @@ impl SourcesPane {
             let count = tracks.iter().filter(|track| matches!(&track.location, MediaLocation::Local(file) if file.starts_with(&path))).count();
             ProviderRow { title: path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string()),
                 detail: format!("Local folder · {count} songs · {}", path.display()), icon: Icon::Folder, id: ProviderId::Local(path) }
-        }).chain(workspace.sources.get().into_iter().map(|source| ProviderRow {
-            id: ProviderId::Remote(source.id), title: source.name,
-            detail: match source.plugin_id.as_str() { "kanade" => "Kanade", "dlna" => "DLNA", _ => "Source plugin" }.into(), icon: Icon::Network,
+        }).chain(workspace.sources.get().into_iter().map(|source| {
+            let count = tracks.iter().filter(|track| track.source_id == source.id).count();
+            let kind = match source.plugin_id.as_str() { "kanade" => "Kanade", "dlna" => "DLNA", _ => "Source plugin" };
+            let detail = workspace.sync_statuses.get().get(&source.id).map(|status| format!("{kind} · {count} songs · {status}")).unwrap_or_else(|| format!("{kind} · {count} songs"));
+            ProviderRow { id: ProviderId::Remote(source.id), title: source.name, detail, icon: Icon::Network }
         })).collect::<Vec<_>>();
         rows.sort_by_key(|row| row.title.to_lowercase());
         let count = rows.len();
@@ -1135,6 +1458,12 @@ impl SourcesPane {
                 TextField::new(workspace.source_url.clone()).placeholder(match workspace.source_kind.get() {
                     2 => "DLNA device description URL", 3 => "Absolute path to the source plugin executable", _ => "Kanade server URL",
                 }).font_size(13.).padding(8.).on_key(|_| true).frame(form_width,36.),
+                if cfg!(target_os = "macos") && workspace.source_kind.get() == 1 {
+                    AnyView::new(hstack! {
+                        Toggle::new(workspace.source_kanade_identity.clone()).frame(36.,22.),
+                        caption("Use KanadeApp client certificate").alignment(Alignment::Leading).frame(form_width - 48.,32.),
+                    }.spacing(12.).frame(form_width,32.))
+                } else { AnyView::new(Spacer::new().frame(0.,0.)) },
                 button("Connect").icon(Icon::Network).on_click(move || connect.workspace.add_source(&connect)).frame(110.,32.)
                     .alignment(Alignment::Leading).frame(form_width,40.),
             }.spacing(10.))
@@ -1158,6 +1487,31 @@ impl SourcesPane {
         let remove = workspace.clone();
         let open = self.app.clone();
         let local = matches!(workspace.source_selection.get(), Some(ProviderId::Local(_)));
+        let kanade = workspace
+            .selected_source()
+            .is_some_and(|source| source.plugin_id == "kanade");
+        let sync_here = workspace
+            .source_sync
+            .get()
+            .is_some_and(|id| workspace.source_selection.get() == Some(ProviderId::Remote(id)));
+        let sync_status = workspace
+            .selected_source()
+            .and_then(|source| workspace.sync_statuses.get().get(&source.id).cloned())
+            .unwrap_or_default();
+        let identity_controls = cfg!(target_os = "macos") && kanade;
+        let identity_enabled = workspace.selected_source().is_some_and(|source| {
+            source
+                .settings
+                .get("kanade_app_identity")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+        let status_height = if kanade { 52. } else { 28. }
+            + if identity_controls {
+                if identity_enabled { 72. } else { 36. }
+            } else {
+                0.
+            };
         let title = match workspace.source_selection.get() {
             Some(ProviderId::Local(path)) => path
                 .file_name()
@@ -1192,7 +1546,23 @@ impl SourcesPane {
             0.
         };
         let activity = crate::library_folders::source_activity(workspace, width, activity_height);
-        let refresh = if activity_here && workspace.folders.can_cancel() {
+        let refresh = if sync_here {
+            if workspace.source_sync_saving.get() {
+                AnyView::new(caption("Saving…").frame(100., 32.))
+            } else {
+                let cancel = workspace.clone();
+                AnyView::new(
+                    button("Cancel sync")
+                        .header_style()
+                        .on_click(move || {
+                            if let Some(ProviderId::Remote(id)) = cancel.source_selection.get() {
+                                cancel.cancel_source_sync(Some(&id));
+                            }
+                        })
+                        .frame(100., 32.),
+                )
+            }
+        } else if activity_here && workspace.folders.can_cancel() {
             let cancel = workspace.clone();
             AnyView::new(
                 button("Cancel scan")
@@ -1210,7 +1580,7 @@ impl SourcesPane {
                 .alignment(Alignment::Leading)
                 .frame(100., 32.),
             )
-        } else if local && workspace.read_only.get() {
+        } else if (local || kanade) && workspace.read_only.get() {
             AnyView::new(caption("Read only").frame(100., 32.))
         } else {
             AnyView::new(
@@ -1222,6 +1592,9 @@ impl SourcesPane {
                             root.workspace.library_command(LibraryCommand::Scan(path))
                         }
                         _ => {
+                            if let Some(config) = root.workspace.selected_source() {
+                                root.workspace.request_source_sync(&config);
+                            }
                             let parent = root.workspace.history.borrow().last().cloned().flatten();
                             root.workspace.browse_provider(&root, parent);
                         }
@@ -1241,7 +1614,74 @@ impl SourcesPane {
                     .frame(112., 32.),
             )
         };
-        let content_height = self.height - LIBRARY_HEADER_HEIGHT - 28. - activity_height;
+        let identity_control = if identity_controls {
+            let reconnect = self.app.clone();
+            let enabled = workspace.selected_source().is_some_and(|source| {
+                source
+                    .settings
+                    .get("kanade_app_identity")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            });
+            if workspace.config_writable
+                && !workspace.read_only.get()
+                && !workspace.source_sync_saving.get()
+                && workspace.source_authorizing.get().is_none()
+            {
+                AnyView::new(
+                    button(if enabled {
+                        "KanadeApp certificate: On"
+                    } else {
+                        "KanadeApp certificate: Off"
+                    })
+                    .header_style()
+                    .on_click(move || reconnect.workspace.toggle_kanade_identity(&reconnect))
+                    .frame(240., 28.)
+                    .alignment(Alignment::Leading)
+                    .padding_insets(EdgeInsets::horizontal(20.))
+                    .frame(width, 36.),
+                )
+            } else {
+                AnyView::new(
+                    caption(if enabled {
+                        "KanadeApp certificate: On"
+                    } else {
+                        "KanadeApp certificate: Off"
+                    })
+                    .alignment(Alignment::Leading)
+                    .padding_insets(EdgeInsets::horizontal(20.))
+                    .frame(width, 36.),
+                )
+            }
+        } else {
+            AnyView::new(Spacer::new().frame(0., 0.))
+        };
+        let authorization_control = if identity_controls && identity_enabled {
+            if workspace.source_authorizing.get().is_some() {
+                AnyView::new(
+                    caption("Certificate authorization pending…")
+                        .alignment(Alignment::Leading)
+                        .padding_insets(EdgeInsets::horizontal(20.))
+                        .frame(width, 36.),
+                )
+            } else if workspace.config_writable && !workspace.read_only.get() {
+                let authorize = workspace.clone();
+                AnyView::new(
+                    button("Authorize certificate…")
+                        .header_style()
+                        .on_click(move || authorize.authorize_kanade_identity())
+                        .frame(240., 28.)
+                        .alignment(Alignment::Leading)
+                        .padding_insets(EdgeInsets::horizontal(20.))
+                        .frame(width, 36.),
+                )
+            } else {
+                AnyView::new(Spacer::new().frame(width, 36.))
+            }
+        } else {
+            AnyView::new(Spacer::new().frame(0., 0.))
+        };
+        let content_height = self.height - LIBRARY_HEADER_HEIGHT - status_height - activity_height;
         let entries = if workspace.source_entries.get().is_empty() {
             catalog_empty(
                 Icon::Music,
@@ -1285,6 +1725,9 @@ impl SourcesPane {
             back_header(&title,AnyView::new(hstack! { refresh, remove_action }.spacing(8.)),220.,width,move || back.workspace.back_in_source(&back)),
             Text::from_state(workspace.source_status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()).alignment(Alignment::Leading)
                 .padding_insets(EdgeInsets::horizontal(20.)).frame(width,28.),
+            if kanade { AnyView::new(caption(sync_status).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(20.)).frame(width,24.)) } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+            identity_control,
+            authorization_control,
             activity,
             entries,
         }.spacing(0.),SurfaceRole::Canvas).frame(width,self.height))
@@ -1305,6 +1748,10 @@ impl View for SourcesPane {
             &workspace.source_selection,
             &workspace.source_kind,
             &workspace.source_page,
+            &workspace.source_sync,
+            &workspace.source_sync_saving,
+            &workspace.source_authorizing,
+            &workspace.sync_statuses,
             &workspace.roots,
             &workspace.library,
             &workspace.read_only,
@@ -1415,6 +1862,146 @@ mod tests {
             receiver,
         });
         release
+    }
+    #[test]
+    fn kanade_sync_is_queued_once_and_read_only_sources_are_not_synced() {
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        let config = source("kanade");
+        workspace.request_source_sync(&config);
+        workspace.request_source_sync(&config);
+        assert_eq!(workspace.pending_sync.borrow().len(), 1);
+        workspace.cancel_source_sync(Some("kanade"));
+        assert!(workspace.pending_sync.borrow().is_empty());
+        workspace.read_only.set(true);
+        workspace.request_source_sync(&config);
+        assert!(workspace.pending_sync.borrow().is_empty());
+        assert!(workspace.sync_statuses.get()["kanade"].contains("read-only"));
+        workspace.read_only.set(false);
+        let mut dlna = config;
+        dlna.plugin_id = "dlna".into();
+        workspace.request_source_sync(&dlna);
+        assert!(workspace.pending_sync.borrow().is_empty());
+    }
+    #[test]
+    fn certificate_authorization_requires_explicit_opt_in_and_shutdown_cancels_pending_requests() {
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        workspace.sources.set(vec![source("unapproved")]);
+        workspace
+            .source_selection
+            .set(Some(ProviderId::Remote("unapproved".into())));
+        workspace.authorize_kanade_identity();
+        assert!(workspace.source_authorizing.get().is_none());
+        assert!(workspace.authorization_config.borrow().is_none());
+        assert!(workspace.sync_statuses.get()["unapproved"].contains("Enable"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        *workspace.authorization_cancel.borrow_mut() = Some(cancel.clone());
+        workspace.shutdown();
+        assert!(cancel.load(Ordering::Acquire));
+    }
+    #[test]
+    fn insecure_source_cannot_persist_a_client_certificate_setting() {
+        let app = app();
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        let config = source("insecure");
+        workspace.sources.set(vec![config.clone()]);
+        workspace
+            .source_selection
+            .set(Some(ProviderId::Remote(config.id.clone())));
+        workspace.toggle_kanade_identity(&app);
+        assert_eq!(workspace.sources.get()[0].settings, config.settings);
+        assert!(!workspace.dirty.get());
+        assert!(workspace.pending_sync.borrow().is_empty());
+        assert!(workspace.network.borrow().is_none());
+        assert!(workspace.sync_statuses.get()["insecure"].contains("HTTPS"));
+    }
+    #[test]
+    fn saved_kanade_certificate_setting_reconnects_without_removing_library() {
+        let app = app();
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        let mut config = source("existing");
+        config.settings["url"] = "https://example.invalid".into();
+        workspace.sources.set(vec![config]);
+        workspace
+            .source_selection
+            .set(Some(ProviderId::Remote("existing".into())));
+        let release = hold_network(&workspace);
+        workspace.toggle_kanade_identity(&app);
+        assert_eq!(workspace.sources.get()[0].id, "existing");
+        assert_eq!(
+            workspace.sources.get()[0].settings["kanade_app_identity"],
+            true
+        );
+        assert_eq!(workspace.pending_sync.borrow().len(), 1);
+        assert!(workspace.dirty.get());
+        workspace.toggle_kanade_identity(&app);
+        assert_eq!(
+            workspace.sources.get()[0].settings["kanade_app_identity"],
+            false
+        );
+        assert_eq!(workspace.pending_sync.borrow().len(), 1);
+        assert_eq!(workspace.sources.get().len(), 1);
+        workspace.cancel();
+        release.send(()).unwrap();
+        workspace
+            .network
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .handle
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn removing_source_cannot_be_requeued_by_startup_or_refresh() {
+        let mut workspace = Workspace::memory();
+        workspace.config_writable = true;
+        let config = source("removing");
+        workspace.sources.set(vec![config.clone()]);
+        workspace
+            .pending_removals
+            .borrow_mut()
+            .insert(config.id.clone());
+        workspace.request_source_sync(&config);
+        assert!(workspace.pending_sync.borrow().is_empty());
+        // Also reject an already queued request, before contacting the worker.
+        workspace
+            .pending_sync
+            .borrow_mut()
+            .push_back(config.id.clone());
+        workspace.poll_source_sync();
+        assert!(workspace.pending_sync.borrow().is_empty());
+        assert!(workspace.source_sync.get().is_none());
+        assert!(workspace.sync_statuses.get().is_empty());
+        workspace.pending_removals.borrow_mut().remove(&config.id);
+        workspace.request_source_sync(&config);
+        assert_eq!(workspace.pending_sync.borrow().len(), 1);
+    }
+    #[test]
+    fn browsing_another_source_does_not_cancel_library_sync() {
+        let app = app();
+        let workspace = &app.workspace;
+        let release = hold_network(workspace);
+        let control = Arc::new(SourceSyncControl::default());
+        *workspace.sync_control.borrow_mut() = Some(control.clone());
+        workspace.source_sync.set(Some("indexing".into()));
+        workspace.open_provider(&app, ProviderId::Remote("different".into()));
+        assert_eq!(workspace.source_sync.get().as_deref(), Some("indexing"));
+        assert!(!control.is_saving());
+        assert!(!workspace.sync_statuses.get().contains_key("indexing"));
+        workspace.cancel();
+        release.send(()).unwrap();
+        workspace
+            .network
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .handle
+            .join()
+            .unwrap();
     }
     #[test]
     fn remote_queue_addition_is_lazy_and_keeps_provider_metadata() {

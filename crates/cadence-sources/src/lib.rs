@@ -6,6 +6,7 @@
 
 mod dlna;
 mod kanade;
+mod kanade_tls;
 mod net;
 mod process;
 #[cfg(target_os = "scarlet")]
@@ -67,7 +68,20 @@ pub struct SourcePage {
 /// and sessions for the lifetime of an open stream or an explicit download.
 pub trait SourcePlugin: Send + Sync {
     fn descriptor(&self) -> PluginDescriptor;
+    fn validate_config(&self, _config: &SourceConfig) -> Result<()> {
+        Ok(())
+    }
     fn browse(&self, config: &SourceConfig, container: Option<&str>) -> Result<SourcePage>;
+    /// Return a complete catalogue, or fail without publishing a partial result.
+    /// Providers without a full-library endpoint keep their existing browsing API.
+    fn catalog_cancellable(
+        &self,
+        _config: &SourceConfig,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<LibraryTrack>> {
+        check_cancel(cancel)?;
+        Err("This source does not support library synchronization".into())
+    }
     fn browse_cancellable(
         &self,
         config: &SourceConfig,
@@ -185,6 +199,35 @@ impl SourceRegistry {
     pub fn browse(&self, config: &SourceConfig, container: Option<&str>) -> Result<SourcePage> {
         self.plugin(config)?.browse(config, container)
     }
+    /// Validate configuration without network access or reading credentials.
+    pub fn validate_config(&self, config: &SourceConfig) -> Result<()> {
+        self.plugin(config)?.validate_config(config)
+    }
+    /// May show a macOS Keychain prompt. Invoke only after an explicit user
+    /// action, on a worker; background catalogue/media loading never calls this.
+    pub fn authorize_source_identity(&self, config: &SourceConfig) -> Result<()> {
+        self.validate_config(config)?;
+        if config.plugin_id != "kanade" {
+            return Err("This source does not support certificate authorization".into());
+        }
+        kanade_tls::Transport::authorize_source(config)
+    }
+    /// Forget approved in-memory transport state when its source is removed or
+    /// certificate access is disabled. This never changes Keychain contents.
+    pub fn forget_source_identity(&self, source_id: &str) {
+        kanade_tls::Transport::forget_source(source_id);
+    }
+    /// Fetch a complete library snapshot on a cancellable background worker.
+    pub fn catalog_cancellable(
+        &self,
+        config: &SourceConfig,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<LibraryTrack>> {
+        check_cancel(cancel)?;
+        let tracks = self.plugin(config)?.catalog_cancellable(config, cancel)?;
+        check_cancel(cancel)?;
+        Ok(tracks)
+    }
     pub fn browse_cancellable(
         &self,
         config: &SourceConfig,
@@ -214,8 +257,11 @@ impl SourceRegistry {
         // IDs may themselves contain private provider data. Hash the complete
         // source identity rather than exposing it via queue/debug output.
         use sha2::{Digest, Sha256};
-        let identity = serde_json::to_vec(&(&config.id, &config.plugin_id, &track.id))
-            .map_err(|_| "Cannot encode source identity")?;
+        // Re-selecting a song after changing transport/auth settings must open a
+        // new input rather than reusing a queued closure with the old settings.
+        let identity =
+            serde_json::to_vec(&(&config.id, &config.plugin_id, &config.settings, &track.id))
+                .map_err(|_| "Cannot encode source identity")?;
         let id = format!("source:{:x}", Sha256::digest(identity));
         let extension_hint = match &track.location {
             MediaLocation::Local(path) => {
@@ -344,6 +390,9 @@ mod streaming_contract_tests {
         assert!(input.extension_hint().is_none());
         assert!(!format!("{input:?}").contains("secret"));
         assert_eq!(input, registry.stream_input(&config, &track).unwrap());
+        let mut reconfigured = config.clone();
+        reconfigured.settings = serde_json::json!({"token":"another-token"});
+        assert_ne!(input, registry.stream_input(&reconfigured, &track).unwrap());
         let mut queued = cadence_core::Track::from_path(PathBuf::new());
         queued.media_input = Some(input);
         for _ in 0..2 {

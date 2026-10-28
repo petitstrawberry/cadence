@@ -18,6 +18,13 @@ tungstenite = { version = "=0.30.0", default-features = false, features = ["hand
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "=3.5.1"
+p12-keystore = "=0.4.1"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.9"
+zeroize = "=1.9.0"
+
 [target.'cfg(target_os = "scarlet")'.dependencies]
 getrandom = "=0.4.3"
 scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca" }

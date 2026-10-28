@@ -1,7 +1,7 @@
 //! Serialized library I/O. The UI only sends requests and consumes snapshots.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,8 +17,46 @@ pub enum LibraryCommand {
     Rescan,
     RemoveRoot(PathBuf),
     RemoveSource(String),
+    AuthorizeSource {
+        config: cadence_sources::SourceConfig,
+        cancel: Arc<AtomicBool>,
+    },
     Upsert(Vec<LibraryTrack>),
+    SyncSource {
+        config: cadence_sources::SourceConfig,
+        control: Arc<SourceSyncControl>,
+    },
     Remove(String),
+}
+
+/// Cancellation wins before saving starts; once saving starts the UI waits for
+/// the durable result instead of claiming a cancelled operation was discarded.
+#[derive(Debug, Default)]
+pub struct SourceSyncControl {
+    cancelled: AtomicBool,
+    phase: AtomicU8,
+}
+impl SourceSyncControl {
+    pub fn cancel(&self) -> bool {
+        if self
+            .phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.cancelled.store(true, Ordering::Release);
+            true
+        } else {
+            self.phase.load(Ordering::Acquire) == 1
+        }
+    }
+    pub fn is_saving(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == 2
+    }
+    fn begin_save(&self) -> bool {
+        self.phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 impl LibraryCommand {
@@ -36,6 +74,9 @@ pub struct LibraryEvent {
     /// A failed load protects the original file from subsequent mutations.
     pub read_only: bool,
     pub removed_source: Option<String>,
+    pub synced_source: Option<String>,
+    pub source_removal: Option<String>,
+    pub authorized_source: Option<String>,
 }
 
 pub struct LibraryWorker {
@@ -93,6 +134,15 @@ impl LibraryWorker {
                         worker_pending.store(false, Ordering::Release);
                         continue;
                     }
+                    if worker_stopped.load(Ordering::Acquire)
+                        && matches!(
+                            &command,
+                            LibraryCommand::AuthorizeSource { .. }
+                                | LibraryCommand::SyncSource { .. }
+                        )
+                    {
+                        continue;
+                    }
                     let event = state.run(command, &worker_cancel);
                     if is_scan {
                         worker_pending.store(false, Ordering::Release);
@@ -111,6 +161,9 @@ impl LibraryWorker {
                     error: Some(format!("Unable to start library worker: {error}")),
                     read_only: true,
                     removed_source: None,
+                    synced_source: None,
+                    source_removal: None,
+                    authorized_source: None,
                 });
                 None
             }
@@ -248,6 +301,9 @@ impl LibraryState {
             error,
             read_only: self.read_only,
             removed_source: None,
+            synced_source: None,
+            source_removal: None,
+            authorized_source: None,
         }
     }
 
@@ -281,6 +337,26 @@ impl LibraryState {
     }
 
     fn run(&mut self, command: LibraryCommand, cancel: &AtomicBool) -> LibraryEvent {
+        let source = match &command {
+            LibraryCommand::SyncSource { config, .. } => Some(config.id.clone()),
+            _ => None,
+        };
+        let removal = match &command {
+            LibraryCommand::RemoveSource(source) => Some(source.clone()),
+            _ => None,
+        };
+        let authorized = match &command {
+            LibraryCommand::AuthorizeSource { config, .. } => Some(config.id.clone()),
+            _ => None,
+        };
+        let mut event = self.run_inner(command, cancel);
+        event.synced_source = source;
+        event.source_removal = removal;
+        event.authorized_source = authorized;
+        event
+    }
+
+    fn run_inner(&mut self, command: LibraryCommand, cancel: &AtomicBool) -> LibraryEvent {
         if matches!(command, LibraryCommand::Load) {
             return self.load();
         }
@@ -327,9 +403,55 @@ impl LibraryState {
                     None,
                 );
                 if event.error.is_none() {
+                    cadence_sources::SourceRegistry::builtin().forget_source_identity(&source);
                     event.removed_source = Some(source);
                 }
                 return event;
+            }
+            LibraryCommand::AuthorizeSource { config, cancel } => {
+                if cancel.load(Ordering::Acquire) {
+                    return self.event(
+                        "Certificate authorization cancelled".into(),
+                        Some("Certificate authorization cancelled".into()),
+                    );
+                }
+                let registry = cadence_sources::SourceRegistry::builtin();
+                let result = registry.authorize_source_identity(&config);
+                if cancel.load(Ordering::Acquire) {
+                    registry.forget_source_identity(&config.id);
+                    return self.event(
+                        "Certificate authorization cancelled".into(),
+                        Some("Certificate authorization cancelled".into()),
+                    );
+                }
+                return match result {
+                    Ok(()) => self.event("Client certificate authorized".into(), None),
+                    Err(error) => self.event(
+                        "Client certificate authorization failed".into(),
+                        Some(error),
+                    ),
+                };
+            }
+            LibraryCommand::SyncSource { config, control } => {
+                if config.plugin_id != "kanade" {
+                    return self.event(
+                        "Source sync failed".into(),
+                        Some("This source does not support library sync".into()),
+                    );
+                }
+                let tracks = match cadence_sources::SourceRegistry::builtin()
+                    .catalog_cancellable(&config, &control.cancelled)
+                {
+                    Ok(tracks) => tracks,
+                    Err(_) if control.cancelled.load(Ordering::Acquire) => {
+                        return self.event("Sync cancelled · Library unchanged".into(), None);
+                    }
+                    Err(error) => {
+                        return self
+                            .event("Source sync failed · Library unchanged".into(), Some(error));
+                    }
+                };
+                return self.replace_source(&config.id, tracks, &control);
             }
             LibraryCommand::Upsert(tracks) => {
                 let count = tracks.len();
@@ -349,6 +471,34 @@ impl LibraryState {
             LibraryCommand::Load => unreachable!("load was handled above"),
         };
         self.commit(candidate, status, warning)
+    }
+
+    fn replace_source(
+        &mut self,
+        source: &str,
+        tracks: Vec<LibraryTrack>,
+        control: &SourceSyncControl,
+    ) -> LibraryEvent {
+        let mut identities = std::collections::HashSet::new();
+        if tracks
+            .iter()
+            .any(|track| track.source_id != source || !identities.insert(track.id.clone()))
+        {
+            return self.event(
+                "Source sync failed · Library unchanged".into(),
+                Some("Source returned duplicate tracks or a different source identity".into()),
+            );
+        }
+        let count = tracks.len();
+        let mut candidate = self.library.clone();
+        candidate.remove_source(source);
+        if let Err(error) = candidate.upsert_many(tracks) {
+            return self.event("Source sync failed · Library unchanged".into(), Some(error));
+        }
+        if !control.begin_save() {
+            return self.event("Sync cancelled · Library unchanged".into(), None);
+        }
+        self.commit(candidate, format!("Library synced · {count} songs"), None)
     }
 
     fn refresh_ordering_metadata(&mut self, cancel: &AtomicBool) -> LibraryEvent {
@@ -530,6 +680,134 @@ mod tests {
             .unwrap()
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
+    }
+
+    #[test]
+    fn source_refresh_replaces_only_that_source_and_empty_refresh_removes_stale_tracks() {
+        let directory = Directory::new();
+        let path = directory.0.join("library.json");
+        let mut state = LibraryState::new(path.clone());
+        let mut other = track("other");
+        other.source_id = "other-source".into();
+        other.id = track_id(&other.source_id, &other.item_id);
+        state
+            .library
+            .upsert_many([track("removed"), track("updated"), other.clone()])
+            .unwrap();
+        state.library.save(&path).unwrap();
+        let mut updated = track("updated");
+        updated.title = "Updated title".into();
+        let event = state.replace_source(
+            "test",
+            vec![updated.clone(), track("new")],
+            &SourceSyncControl::default(),
+        );
+        assert!(event.error.is_none());
+        assert_eq!(event.tracks.len(), 3);
+        assert!(event.tracks.contains(&updated));
+        assert!(event.tracks.contains(&other));
+        assert!(!event.tracks.iter().any(|entry| entry.item_id == "removed"));
+        assert_eq!(Library::load(&path).unwrap().tracks(), event.tracks);
+        let empty = state.replace_source("test", vec![], &SourceSyncControl::default());
+        assert!(empty.error.is_none());
+        assert!(empty.status.contains("0 songs"));
+        assert_eq!(empty.tracks, vec![other]);
+        assert_eq!(Library::load(&path).unwrap().tracks(), empty.tracks);
+    }
+
+    #[test]
+    fn source_refresh_validation_cancellation_and_save_errors_preserve_previous_catalog() {
+        let directory = Directory::new();
+        let path = directory.0.join("library.json");
+        let mut state = LibraryState::new(path.clone());
+        state.library.upsert(track("existing")).unwrap();
+        state.library.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let cancelled = SourceSyncControl::default();
+        assert!(cancelled.cancel());
+        let event = state.replace_source("test", vec![], &cancelled);
+        assert!(event.status.contains("cancelled"));
+        assert_eq!(event.tracks, vec![track("existing")]);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut wrong_source = track("new");
+        wrong_source.source_id = "different".into();
+        let mut invalid = track("invalid");
+        invalid.id = "invalid identity".into();
+        for tracks in [
+            vec![wrong_source],
+            vec![invalid],
+            vec![track("duplicate"), track("duplicate")],
+        ] {
+            let event = state.replace_source("test", tracks, &SourceSyncControl::default());
+            assert!(event.error.is_some());
+            assert_eq!(event.tracks, vec![track("existing")]);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        state.path = directory.0.clone(); // a directory cannot become a catalog file
+        let event = state.replace_source("test", vec![], &SourceSyncControl::default());
+        assert!(event.error.is_some());
+        assert_eq!(event.tracks, vec![track("existing")]);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn source_sync_read_only_rejection_reports_source_without_connecting() {
+        let directory = Directory::new();
+        let mut state = LibraryState::new(directory.0.join("library.json"));
+        state.read_only = true;
+        let event = state.run(
+            LibraryCommand::SyncSource {
+                config: cadence_sources::SourceConfig {
+                    id: "protected".into(),
+                    name: "Protected".into(),
+                    plugin_id: "kanade".into(),
+                    settings: serde_json::json!({"url":"invalid"}),
+                },
+                control: Arc::new(SourceSyncControl::default()),
+            },
+            &AtomicBool::new(false),
+        );
+        assert_eq!(event.synced_source.as_deref(), Some("protected"));
+        assert!(event.error.unwrap().contains("Repair the library file"));
+    }
+
+    #[test]
+    fn cancelled_or_invalid_certificate_authorization_never_mutates_the_catalog() {
+        let directory = Directory::new();
+        let path = directory.0.join("library.json");
+        let mut state = LibraryState::new(path.clone());
+        state.library.upsert(track("existing")).unwrap();
+        state.library.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        // Cancellation is checked before the identity provider. Invalid URL
+        // validation also finishes before any Keychain query or native prompt.
+        for (url, cancelled) in [("https://example.invalid", true), ("invalid-url", false)] {
+            let event = state.run(
+                LibraryCommand::AuthorizeSource {
+                    config: cadence_sources::SourceConfig {
+                        id: "test".into(),
+                        name: "Test".into(),
+                        plugin_id: "kanade".into(),
+                        settings: serde_json::json!({"url":url,"kanade_app_identity":true}),
+                    },
+                    cancel: Arc::new(AtomicBool::new(cancelled)),
+                },
+                &AtomicBool::new(false),
+            );
+            assert_eq!(event.authorized_source.as_deref(), Some("test"));
+            assert!(event.error.is_some());
+            assert_eq!(event.tracks, vec![track("existing")]);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn source_sync_cannot_be_cancelled_after_saving_starts() {
+        let control = SourceSyncControl::default();
+        assert!(control.begin_save());
+        assert!(control.is_saving());
+        assert!(!control.cancel());
+        assert!(!control.cancelled.load(Ordering::Acquire));
     }
 
     #[test]

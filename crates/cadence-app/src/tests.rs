@@ -902,6 +902,9 @@ fn pointer_switches_all_workspace_tabs() {
 fn library_search_selection_and_queue_preserve_catalog_metadata() {
     let app = app();
     library_entries(&app);
+    let mut catalog = app.workspace.library.get();
+    catalog[0].album_artist = Some("Guest conductor".into());
+    app.workspace.library.set(catalog);
     let size = Size::new(1280., 768.);
     let mut tree = layout(&app, size);
     let mut dispatcher = click_with_dispatcher(&mut tree, "Search title, artist, or album");
@@ -929,6 +932,7 @@ fn library_search_selection_and_queue_preserve_catalog_metadata() {
     for (query, count) in [
         ("ensemble", 3),
         ("SMALL MOMENTS", 3),
+        ("GUEST CONDUCTOR", 1),
         ("no matching track", 0),
     ] {
         app.workspace.query.set(query.into());
@@ -1255,11 +1259,13 @@ fn render_offscreen_ui_for_visual_review() {
         for mode in modes().chain([
             "source-overview",
             "source-connect",
+            "kanade-connect",
+            "kanade-authorization",
             "artist-albums",
             "album-detail",
             "library-long",
         ]) {
-            let app = app();
+            let mut app = app();
             app.size.set(size);
             match mode {
                 "source-overview" => {
@@ -1276,6 +1282,35 @@ fn render_offscreen_ui_for_visual_review() {
                     app.workspace
                         .source_page
                         .set(extension::SourcePage::Connect);
+                }
+                "kanade-connect" => {
+                    app.workspace.tab.set(Tab::Sources);
+                    app.workspace
+                        .source_page
+                        .set(extension::SourcePage::Connect);
+                    app.workspace.source_kind.set(1);
+                    app.workspace.source_name.set("Kanade home".into());
+                    app.workspace
+                        .source_url
+                        .set("https://kanade.example.com".into());
+                }
+                "kanade-authorization" => {
+                    // Render the actual authorization controls without opening
+                    // a native window, reading Keychain or dispatching network I/O.
+                    app.workspace = Workspace::persistent(
+                        directory.join(format!("{name}-render-state")),
+                        persistence::LoadedConfig {
+                            config: Default::default(),
+                            writable: true,
+                            error: None,
+                        },
+                    );
+                    source_entries(&app);
+                    let mut sources = app.workspace.sources.get();
+                    sources[0].settings["kanade_app_identity"] = true.into();
+                    app.workspace.sources.set(sources);
+                    app.workspace.source_entries.set(vec![]);
+                    app.workspace.source_status.set("HTTP 403 · Check server access, or authorize the selected client certificate.".into());
                 }
                 "artist-albums" => prepare_mode(&app, "artists"),
                 "album-detail" => prepare_mode(&app, "albums"),

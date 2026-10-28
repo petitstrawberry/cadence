@@ -55,6 +55,9 @@ fn open_response(
         "Source response headers timed out",
         move || match request.call() {
             Ok(reply) => Ok(reply),
+            Err(ureq::Error::Status(code @ (401 | 403), _)) => Err(format!(
+                "Source authorization expired or was rejected (HTTP {code}); reconnect the source and try again"
+            )),
             Err(ureq::Error::Status(code, _)) => Err(format!("Source returned HTTP {code}")),
             Err(ureq::Error::Transport(_)) => Err("Source connection failed or timed out".into()),
         },
@@ -83,7 +86,7 @@ pub(crate) fn open_source(
     result
 }
 
-fn bounded_open<T: Send + 'static>(
+pub(crate) fn bounded_open<T: Send + 'static>(
     cancel: &AtomicBool,
     deadline: Instant,
     timeout_message: &'static str,
@@ -205,6 +208,8 @@ impl Validator {
     }
 }
 
+type UrlResolver = Box<dyn FnMut(&AtomicBool) -> Result<String> + Send + Sync>;
+
 pub(crate) struct HttpStream {
     // Deliberately no Debug implementation: signed URLs belong only to this lease.
     url: String,
@@ -213,19 +218,41 @@ pub(crate) struct HttpStream {
     position: u64,
     cancel: Arc<AtomicBool>,
     lease: Option<SessionLease>,
+    resolver: Option<UrlResolver>,
+    restrict_redirect_origin: bool,
 }
 
 impl HttpStream {
     pub(crate) fn open(url: &str, cancel: Arc<AtomicBool>) -> Result<Self> {
-        check_cancel(&cancel)?;
-        http_url(url)?;
-        let client = ureq::AgentBuilder::new()
+        Self::open_with_client(url, cancel, Self::client(), false)
+    }
+
+    fn client() -> ureq::Agent {
+        ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(READ_TIMEOUT)
             .timeout_write(READ_TIMEOUT)
             .redirects(0)
-            .build();
-        let body = request(&client, url, 0, None, None, &cancel)?;
+            .build()
+    }
+
+    fn open_with_client(
+        url: &str,
+        cancel: Arc<AtomicBool>,
+        client: ureq::Agent,
+        restrict_redirect_origin: bool,
+    ) -> Result<Self> {
+        check_cancel(&cancel)?;
+        http_url(url)?;
+        let body = request(
+            &client,
+            url,
+            0,
+            None,
+            None,
+            &cancel,
+            restrict_redirect_origin,
+        )?;
         check_cancel(&cancel)?;
         Ok(Self {
             url: url.into(),
@@ -234,7 +261,37 @@ impl HttpStream {
             position: 0,
             cancel,
             lease: None,
+            resolver: None,
+            restrict_redirect_origin,
         })
+    }
+
+    /// Resolve authorization immediately before each HTTP request, including
+    /// ranges after a long pause. Providers may cache the URL until its expiry
+    /// margin. The resolver must observe cancellation and return redacted errors;
+    /// it owns no persistent credentials and must not log its temporary URLs.
+    #[cfg(test)]
+    pub(crate) fn open_resolving(
+        cancel: Arc<AtomicBool>,
+        resolver: impl FnMut(&AtomicBool) -> Result<String> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::open_resolving_with_client(cancel, Self::client(), resolver)
+    }
+
+    /// Use the provider's configured transport for every range request. The
+    /// client must retain the bounded timeouts above and disable auto redirects,
+    /// because request() validates each redirect before following it. Resolver
+    /// streams reject redirects to another origin before offering credentials.
+    pub(crate) fn open_resolving_with_client(
+        cancel: Arc<AtomicBool>,
+        client: ureq::Agent,
+        mut resolver: impl FnMut(&AtomicBool) -> Result<String> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        check_cancel(&cancel)?;
+        let url = resolver(&cancel)?;
+        let mut stream = Self::open_with_client(&url, cancel, client, true)?;
+        stream.resolver = Some(Box::new(resolver));
+        Ok(stream)
     }
 
     pub(crate) fn with_lease(mut self, lease: SessionLease) -> Self {
@@ -257,13 +314,19 @@ impl HttpStream {
 
     fn reopen(&mut self, offset: u64) -> io::Result<()> {
         self.check()?;
+        let url = match self.resolver.as_mut() {
+            Some(resolve) => resolve(&self.cancel).map_err(io::Error::other)?,
+            None => self.url.clone(),
+        };
+        self.check()?;
         let body = request(
             &self.client,
-            &self.url,
+            &url,
             offset,
             self.body.length,
             self.body.validator.as_ref(),
             &self.cancel,
+            self.restrict_redirect_origin,
         )
         .map_err(io::Error::other)?;
         // A server silently ignoring Range or changed object must never splice
@@ -275,6 +338,7 @@ impl HttpStream {
             ));
         }
         self.check()?;
+        self.url = url;
         self.body = body;
         self.position = offset;
         Ok(())
@@ -388,8 +452,10 @@ fn request(
     previous_length: Option<u64>,
     validator: Option<&Validator>,
     cancel: &AtomicBool,
+    restrict_redirect_origin: bool,
 ) -> Result<ResponseBody> {
     let mut current = http_url(url)?;
+    let origin = current.origin();
     let end = start.saturating_add(RANGE_BYTES - 1);
     let deadline = Instant::now() + HEADER_TIMEOUT;
     for _ in 0..=5 {
@@ -412,6 +478,9 @@ fn request(
                 .map_err(|_| "Source redirect is invalid")?;
             if current.scheme() == "https" && destination.scheme() != "https" {
                 return Err("Source tried to redirect HTTPS media to an insecure endpoint".into());
+            }
+            if restrict_redirect_origin && destination.origin() != origin {
+                return Err("Source redirected authorized media to another origin".into());
             }
             current = http_url(destination.as_str())?;
             continue;
@@ -724,6 +793,200 @@ mod tests {
         assert_eq!(stream.read(&mut bytes).unwrap(), 0);
         assert!(stream.seek(SeekFrom::End(1)).is_err());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn resolving_stream_refreshes_authorization_for_next_range_and_backward_seek() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            for (version, start, end, bytes) in
+                [(1, 0, 3, "abcd"), (2, 4, 7, "efgh"), (3, 1, 3, "bcd")]
+            {
+                let mut socket = accept(&listener);
+                let request = receive_request(&mut socket);
+                // The server accepts only the current signature. In particular,
+                // a resumed read must not reuse the URL from the first request.
+                assert!(
+                    request
+                        .starts_with(&format!("GET /media?signature=version-{version} HTTP/1.1"))
+                );
+                assert!(request.contains(&format!("Range: bytes={start}-")));
+                if version > 1 {
+                    assert!(request.contains("If-Range: \"same-media\""));
+                }
+                let reply = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/8\r\nETag: \"same-media\"\r\nConnection: close\r\n\r\n{bytes}",
+                    bytes.len()
+                );
+                socket.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolutions = calls.clone();
+        let mut stream = HttpStream::open_resolving(Arc::new(AtomicBool::new(false)), move |_| {
+            let version = resolutions.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(format!("{base}/media?signature=version-{version}"))
+        })
+        .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdefgh");
+        stream.seek(SeekFrom::Start(1)).unwrap();
+        let mut backwards = [0; 3];
+        stream.read_exact(&mut backwards).unwrap();
+        assert_eq!(&backwards, b"bcd");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn resolving_stream_rejects_cross_origin_redirects_before_connecting() {
+        for redirect_on_seek in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let target = format!(
+                "http://{}/private?signature=secret",
+                destination.local_addr().unwrap()
+            );
+            let url = format!(
+                "http://{}/media?signature=secret",
+                listener.local_addr().unwrap()
+            );
+            let worker = std::thread::spawn(move || {
+                if redirect_on_seek {
+                    let mut socket = accept(&listener);
+                    receive_request(&mut socket);
+                    socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nConnection: close\r\n\r\nwave").unwrap();
+                }
+                let mut socket = accept(&listener);
+                receive_request(&mut socket);
+                write!(socket, "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            });
+            let result = HttpStream::open_resolving(Arc::new(AtomicBool::new(false)), move |_| {
+                Ok(url.clone())
+            });
+            let error = if redirect_on_seek {
+                let mut stream = result.unwrap();
+                let error = stream.seek(SeekFrom::Start(1)).unwrap_err().to_string();
+                assert_eq!(stream.stream_position().unwrap(), 0);
+                error
+            } else {
+                result.err().unwrap()
+            };
+            assert!(error.contains("another origin"));
+            assert!(!error.contains("secret"));
+            assert!(!error.contains("127.0.0.1"));
+            worker.join().unwrap();
+            assert_eq!(
+                destination.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn resolving_stream_can_follow_same_origin_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut socket = accept(&listener);
+            receive_request(&mut socket);
+            socket.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /audio?signature=refreshed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(socket);
+            let mut socket = accept(&listener);
+            let request = receive_request(&mut socket);
+            assert!(request.starts_with("GET /audio?signature=refreshed HTTP/1.1"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nConnection: close\r\n\r\nwave").unwrap();
+        });
+        let mut stream =
+            HttpStream::open_resolving(Arc::new(AtomicBool::new(false)), move |_| Ok(url.clone()))
+                .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"wave");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn failed_authorization_refresh_does_not_retry_a_stale_url_or_move_the_reader() {
+        let (url, worker) = server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nConnection: close\r\n\r\nwave",
+        );
+        let mut first = true;
+        let mut stream = HttpStream::open_resolving(Arc::new(AtomicBool::new(false)), move |_| {
+            if first {
+                first = false;
+                Ok(url.clone())
+            } else {
+                Err("Kanade media session expired; reconnect the source".into())
+            }
+        })
+        .unwrap();
+        let error = stream.seek(SeekFrom::Start(2)).unwrap_err();
+        assert!(error.to_string().contains("session expired"));
+        assert!(!error.to_string().contains("signature"));
+        assert_eq!(stream.stream_position().unwrap(), 0);
+        let mut bytes = [0; 4];
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"wave");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn resolving_stream_checks_cancellation_before_credentials_and_http() {
+        let result = HttpStream::open_resolving(Arc::new(AtomicBool::new(true)), |_| {
+            panic!("cancelled opens must not resolve credentials")
+        });
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+
+        let (url, worker) = server(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\nConnection: close\r\n\r\nwave",
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let mut first = true;
+        let mut stream = HttpStream::open_resolving(cancel, move |_| {
+            if first {
+                first = false;
+            } else {
+                signal.store(true, Ordering::Relaxed);
+            }
+            Ok(url.clone())
+        })
+        .unwrap();
+        let error = stream.seek(SeekFrom::Start(1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn expired_http_authorization_has_actionable_redacted_error() {
+        for code in [401, 403] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://{}/media?signature=private-signature",
+                listener.local_addr().unwrap()
+            );
+            let worker = std::thread::spawn(move || {
+                let mut socket = accept(&listener);
+                receive_request(&mut socket);
+                write!(
+                    socket,
+                    "HTTP/1.1 {code} Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let error = HttpStream::open(&url, Arc::new(AtomicBool::new(false)))
+                .err()
+                .unwrap();
+            assert!(error.contains("authorization expired or was rejected"));
+            assert!(error.contains("reconnect"));
+            assert!(!error.contains("signature"));
+            assert!(!error.contains("127.0.0.1"));
+            worker.join().unwrap();
+        }
     }
 
     #[test]

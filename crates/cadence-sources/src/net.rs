@@ -57,8 +57,16 @@ fn response(result: std::result::Result<ureq::Response, ureq::Error>) -> Result<
 }
 
 fn get(url: &str) -> Result<ureq::Response> {
+    get_with_client(url, &agent(), false)
+}
+
+fn get_with_client(
+    url: &str,
+    client: &ureq::Agent,
+    restrict_origin: bool,
+) -> Result<ureq::Response> {
     let mut current = http_url(url)?;
-    let client = agent();
+    let origin = current.origin();
     for _ in 0..=5 {
         let result = response(client.get(current.as_str()).call())?;
         if matches!(result.status(), 301 | 302 | 303 | 307 | 308) {
@@ -70,6 +78,11 @@ fn get(url: &str) -> Result<ureq::Response> {
                 .map_err(|_| "Source redirect is invalid")?;
             if current.scheme() == "https" && destination.scheme() != "https" {
                 return Err("Source tried to redirect HTTPS media to an insecure endpoint".into());
+            }
+            if restrict_origin && destination.origin() != origin {
+                return Err(
+                    "Kanade media redirect must stay on the authorized server origin".into(),
+                );
             }
             current = http_url(destination.as_str())?;
             continue;
@@ -204,6 +217,29 @@ pub(crate) fn download(
     cancel: &AtomicBool,
     pump: &mut dyn FnMut() -> Result<()>,
 ) -> Result<PathBuf> {
+    download_inner(url, key, cache, cancel, pump, &agent(), false)
+}
+
+pub(crate) fn download_with_client(
+    url: &str,
+    key: &str,
+    cache: &Path,
+    cancel: &AtomicBool,
+    pump: &mut dyn FnMut() -> Result<()>,
+    client: &ureq::Agent,
+) -> Result<PathBuf> {
+    download_inner(url, key, cache, cancel, pump, client, true)
+}
+
+fn download_inner(
+    url: &str,
+    key: &str,
+    cache: &Path,
+    cancel: &AtomicBool,
+    pump: &mut dyn FnMut() -> Result<()>,
+    client: &ureq::Agent,
+    restrict_origin: bool,
+) -> Result<PathBuf> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Source request cancelled".into());
     }
@@ -229,7 +265,7 @@ pub(crate) fn download(
         return Ok(path);
     }
     fs::create_dir_all(cache).map_err(|_| "Cannot create media cache")?;
-    let reply = get(url)?;
+    let reply = get_with_client(url, client, restrict_origin)?;
     let declared = reply
         .header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok());
@@ -283,10 +319,29 @@ pub(crate) fn artwork(
     cancel: &AtomicBool,
     pump: &mut dyn FnMut() -> Result<()>,
 ) -> Result<ArtworkData> {
+    artwork_inner(url, cancel, pump, &agent(), false)
+}
+
+pub(crate) fn artwork_with_client(
+    url: &str,
+    cancel: &AtomicBool,
+    pump: &mut dyn FnMut() -> Result<()>,
+    client: &ureq::Agent,
+) -> Result<ArtworkData> {
+    artwork_inner(url, cancel, pump, client, true)
+}
+
+fn artwork_inner(
+    url: &str,
+    cancel: &AtomicBool,
+    pump: &mut dyn FnMut() -> Result<()>,
+    client: &ureq::Agent,
+    restrict_origin: bool,
+) -> Result<ArtworkData> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Source request cancelled".into());
     }
-    let reply = get(url)?;
+    let reply = get_with_client(url, client, restrict_origin)?;
     let media_type = reply
         .header("Content-Type")
         .unwrap_or("application/octet-stream")
@@ -380,5 +435,21 @@ mod tests {
     fn unknown_and_credential_urls_are_rejected() {
         assert!(http_url("file:///etc/passwd").is_err());
         assert!(http_url("http://user:password@example.com").is_err());
+    }
+    #[test]
+    fn authenticated_artwork_never_follows_a_redirect_to_another_origin() {
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let url = server(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            destination.local_addr().unwrap()
+        ));
+        let error = artwork_with_client(&url, &AtomicBool::new(false), &mut || Ok(()), &agent())
+            .unwrap_err();
+        assert!(error.contains("authorized server origin"));
+        assert_eq!(
+            destination.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

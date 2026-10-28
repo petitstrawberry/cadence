@@ -1,5 +1,48 @@
 # 検証記録
 
+## 2026-10-28 — Kanade のライブラリー同期とクライアント証明書
+
+Cadence `877f521` をベースに、Kanade develop
+`e00a3bf531e4598e717dbdfd1ba6cea9c641308c` の Rust protocol / server / DB 実装と
+KanadeApp の既存 Keychain 実装を参照しました。
+
+- `./scripts/dev cargo test --locked --workspace -- --test-threads=1`:
+  **263 passed / 0 failed / 1 ignored**。ignored は既存の実 CLAP Gain を要求するテストです。
+  app 103、sources 62、その他 98 が成功しました。
+- 最後にカタログの累計メタデータを 64 MiB 以内に制限し、sources 62 件を再実行して成功。
+  フォーマット検査と `scripts/bundle-macos --release` も成功し、Apple Silicon 用の
+  `target/macos/Cadence.app` を作成しました。
+- 全曲 API `get_tracks` を 500 曲ずつ取得し、アルバム未分類の曲を含めて同期。
+  重複ページ・不正応答・上限超過・キャンセル時には途中結果を採用しません。
+  source 単位の置換は保存に成功してから UI に反映し、他のソースの曲を保持します。
+  削除と同期の競合、保存失敗、空の結果、設定の read-only、起動時の同期を検証しました。
+- 署名 URL を新しい Range 要求ごとに取得する fixture で、順次再生・逆方向シーク・
+  更新失敗・キャンセルと heartbeat を検証。認証付きメディアの別 origin への
+  リダイレクトを、接続前に拒否することも確認しました。
+- 合成の CA / client certificate / PKCS#12 による、クライアント証明書必須の HTTPS と
+  WSS の往復に成功。実 Keychain へのアクセス・承認ダイアログは実行していません。
+  実証明書は明示的な **Authorize certificate…** 操作だけで読み取る設計で、
+  background は当該アプリ起動中に承認済みのメモリー内キャッシュだけを使用します。
+- `kanade_smoke` を loopback fixture に実行し、2 曲の Library 登録・検索、64×64 カバーの
+  デコード、44.1 kHz PCM のデコード、5 秒位置へのシーク、別セッションでの再開に成功。
+  音源とカタログを保存せず、音声出力やサーバーの再生操作を行わない検査です。
+- 実際の `https://kanade.ichigo.dev` はサーバー証明書の検証に成功し、クライアント証明書の
+  TLS CertificateRequest と nginx の HTTP 403 を返しました。Mac の DNS / route / curl の
+  socket address で LAN 内の直接接続とプロキシ不使用を確認しました。
+  Cadence の新しい API でも HTTP 403 を明示した接続エラーを確認しました。
+  実証明書は利用せず、実ライブラリー・画像・再生の検証は接続条件の確認または所有者の
+  明示的な証明書選択・システム承認待ちです。サーバー・ネットワーク設定は変更していません。
+- CUA の `cua.getApp` で独立した `Cadence Kanade QA.app` を開く操作は、承認待ち後に
+  `aborted by user` となりました。UI 状態が返らず起動結果は不確定のため、再試行・入力操作を
+  行わず、ネイティブ画面での確認は未完了です。テストサーバーは停止済みです。
+  独立した CPU renderer の検査は完了し、最小／標準サイズの 44 画面を生成。
+  Kanade 接続フォームと証明書承認画面の画像を目視し、重なり・切れがないことを確認しました。
+  これはネイティブウィンドウ操作や OS の認証ダイアログの検証とは別です。
+
+ログと fixture は `artifacts/kanade-integration/` にあります。
+Kanade の DB エラーが空配列になる仕様と、ページングに snapshot/revision がない制約は
+サーバー側に残ります。Scarlet / Linux の実行と、実サービスからの出音は未検証です。
+
 ## 2026-10-06 — キューのハイライトとギャップレス再生
 
 - Play queueの色はcurrentのみを参照し、クリック時の選択を併せて着色する条件を撤去。
