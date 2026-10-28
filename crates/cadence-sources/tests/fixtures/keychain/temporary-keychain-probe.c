@@ -1,0 +1,18 @@
+#include <Security/Security.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+#include <unistd.h>
+static void attempt(SecKeychainRef kc, int control, int sync) {
+ CFMutableDictionaryRef d=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
+ CFDictionarySetValue(d,kSecClass,kSecClassGenericPassword); CFDictionarySetValue(d,kSecAttrService,CFSTR("cadence.synthetic.probe"));
+ CFDictionarySetValue(d,kSecAttrAccount,CFSTR("synthetic-only")); CFDictionarySetValue(d,kSecUseKeychain,kc); CFDictionarySetValue(d,kSecAttrLabel,CFSTR("Cadence synthetic test"));
+ const UInt8 text[]="public-synthetic-test";CFDataRef val=CFDataCreate(NULL,text,sizeof(text)-1);CFDictionarySetValue(d,kSecValueData,val);
+ CFErrorRef err=NULL;SecAccessControlRef ac=NULL;
+ if(control==1){ac=SecAccessControlCreateWithFlags(NULL,kSecAttrAccessibleWhenUnlockedThisDeviceOnly,0,&err); if(ac)CFDictionarySetValue(d,kSecAttrAccessControl,ac);}
+ if(control==2)CFDictionarySetValue(d,kSecAttrAccessible,kSecAttrAccessibleWhenUnlockedThisDeviceOnly);
+ if(sync)CFDictionarySetValue(d,kSecAttrSynchronizable,kCFBooleanFalse);
+ OSStatus st=SecItemAdd(d,NULL);printf("control=%d sync=%d access_control_created=%d add_osstatus=%d\n",control,sync,control ? ac!=NULL : -1,(int)st);
+ if(st==errSecSuccess){CFDictionaryRemoveValue(d,kSecValueData); CFMutableDictionaryRef update=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks); CFDictionarySetValue(update,kSecValueData,val); CFMutableDictionaryRef query=CFDictionaryCreateMutableCopy(NULL,0,d); CFDictionaryRemoveValue(query,kSecUseKeychain); CFDictionaryRemoveValue(query,kSecAttrLabel); if(control==1)CFDictionaryRemoveValue(query,kSecAttrAccessControl); if(control==2)CFDictionaryRemoveValue(query,kSecAttrAccessible); const void *keychains[]={kc}; CFArrayRef update_search=CFArrayCreate(NULL,keychains,1,&kCFTypeArrayCallBacks); CFDictionarySetValue(query,kSecMatchSearchList,update_search); OSStatus update_status=SecItemUpdate(query,update); printf("update_osstatus=%d\n",(int)update_status); CFDictionarySetValue(query,kSecReturnAttributes,kCFBooleanTrue); CFTypeRef got=NULL; OSStatus read_status=SecItemCopyMatching(query,&got); int matches=-1; if(read_status==0 && got && CFGetTypeID(got)==CFDictionaryGetTypeID()){ CFTypeRef a=CFDictionaryGetValue((CFDictionaryRef)got,kSecAttrAccessible);matches=a?CFEqual(a,kSecAttrAccessibleWhenUnlockedThisDeviceOnly):0;} printf("attributes_osstatus=%d accessible_device_only=%d\n",(int)read_status,matches);if(got)CFRelease(got);CFRelease(update_search);CFRelease(query);CFRelease(update);if(control==1)CFDictionaryRemoveValue(d,kSecAttrAccessControl);if(control==2)CFDictionaryRemoveValue(d,kSecAttrAccessible);CFDictionaryRemoveValue(d,kSecAttrLabel);CFDictionaryRemoveValue(d,kSecUseKeychain);const void *items[]={kc}; CFArrayRef search=CFArrayCreate(NULL,items,1,&kCFTypeArrayCallBacks); CFDictionarySetValue(d,kSecMatchSearchList,search);OSStatus ds=SecItemDelete(d);CFRelease(search);printf("cleanup_osstatus=%d\n",(int)ds);}
+ if(err)CFRelease(err);if(ac)CFRelease(ac);CFRelease(val);CFRelease(d);
+}
+int main(int argc,char**argv){if(argc!=2)return 2;SecKeychainRef kc=NULL;const char *pw="synthetic-only";OSStatus st=SecKeychainCreate(argv[1],14,pw,0,NULL,&kc);printf("temporary_keychain_create_osstatus=%d\n",(int)st);if(st)return 1;attempt(kc,2,1);attempt(kc,1,1);attempt(kc,1,0);attempt(kc,0,1);attempt(kc,0,0);st=SecKeychainDelete(kc);printf("temporary_keychain_delete_osstatus=%d\n",(int)st);CFRelease(kc);return st==errSecSuccess?0:1;}

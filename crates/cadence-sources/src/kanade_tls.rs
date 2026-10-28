@@ -465,6 +465,28 @@ fn tls_config(
         })
 }
 
+fn encrypt_imported_pkcs12(pkcs12: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    if password.is_empty() {
+        return Err("Use a nonempty certificate password to import securely".into());
+    }
+    let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
+        .map_err(pkcs12_error_message)?;
+    let encrypted = Zeroizing::new(
+        store
+            .writer(password)
+            .encryption_iterations(100_000)
+            .mac_iterations(100_000)
+            .write()
+            .map_err(|_| "Cannot encrypt the imported certificate")?,
+    );
+    if encrypted.len() > MAX_PKCS12_BYTES {
+        return Err(
+            "Encrypted certificate exceeds the 4 MiB limit; previous import was retained".into(),
+        );
+    }
+    Ok(encrypted)
+}
+
 const RECORD_HEADER: &[u8] = b"CadenceIdentity1";
 #[cfg(any(target_os = "macos", test))]
 fn encode_saved_record(pkcs12: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -508,9 +530,21 @@ fn decode_saved_record(record: &[u8]) -> Result<(&[u8], &str)> {
 #[cfg(target_os = "macos")]
 mod secure_store {
     use super::*;
-    use security_framework::{
-        access_control::{ProtectionMode, SecAccessControl},
-        passwords::{self, PasswordOptions},
+    use core_foundation::{
+        base::{CFType, TCFType},
+        boolean::CFBoolean,
+        data::CFData,
+        dictionary::CFDictionary,
+        string::CFString,
+    };
+    use security_framework::passwords::{self, PasswordOptions};
+    use security_framework_sys::{
+        base::{errSecDuplicateItem, errSecSuccess},
+        item::{
+            kSecAttrAccount, kSecAttrLabel, kSecAttrService, kSecAttrSynchronizable, kSecClass,
+            kSecClassGenericPassword, kSecValueData,
+        },
+        keychain_item::{SecItemAdd, SecItemUpdate},
     };
     use sha2::{Digest, Sha256};
     const SERVICE: &str = "org.scarlet-os.cadence.client-identity";
@@ -529,22 +563,68 @@ mod secure_store {
         pkcs12: &[u8],
         password: &str,
     ) -> Result<()> {
-        let record = encode_saved_record(pkcs12, password)?;
-        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
-        options.set_label("Cadence client certificate");
-        options.set_access_synchronized(Some(false));
-        options.set_access_control(
-            SecAccessControl::create_with_protection(
-                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-                0,
-            )
-            .map_err(|_| "Cannot configure Cadence credential protection")?,
-        );
-        passwords::set_generic_password_options(&record, options)
-            .map_err(|_| "Cannot remember this certificate in Cadence's Keychain storage; retry without Remember to use this session only".into())
+        let record = encrypt_imported_pkcs12(pkcs12, password)?;
+        // The macOS file-based Keychain rejects kSecAttrAccessControl and can
+        // ignore device-only accessibility attributes. Store only a separately
+        // password-encrypted PKCS#12, not the password, in the login Keychain.
+        // Keep add-only attributes out of the update query for safe replacement.
+        let name = account(key);
+        let pairs: Vec<(CFString, CFType)> = unsafe {
+            vec![
+                (
+                    CFString::wrap_under_get_rule(kSecClass),
+                    CFString::wrap_under_get_rule(kSecClassGenericPassword).into_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrService),
+                    CFString::from(SERVICE).into_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrAccount),
+                    CFString::from(name.as_str()).into_CFType(),
+                ),
+                (
+                    CFString::wrap_under_get_rule(kSecAttrSynchronizable),
+                    CFBoolean::false_value().into_CFType(),
+                ),
+            ]
+        };
+        let mut add = pairs.clone();
+        unsafe {
+            add.push((
+                CFString::wrap_under_get_rule(kSecAttrLabel),
+                CFString::from("Cadence client certificate").into_CFType(),
+            ));
+            add.push((
+                CFString::wrap_under_get_rule(kSecValueData),
+                CFData::from_buffer(&record).into_CFType(),
+            ));
+        }
+        let attributes = CFDictionary::from_CFType_pairs(&add);
+        let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        let status = if status == errSecDuplicateItem {
+            let query = CFDictionary::from_CFType_pairs(&pairs);
+            let update = CFDictionary::from_CFType_pairs(&[unsafe {
+                (
+                    CFString::wrap_under_get_rule(kSecValueData),
+                    CFData::from_buffer(&record).into_CFType(),
+                )
+            }]);
+            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) }
+        } else {
+            status
+        };
+        if status == errSecSuccess {
+            Ok(())
+        } else {
+            Err(format!(
+                "Keychain import failed (OSStatus {status}). Check Keychain access and retry."
+            ))
+        }
     }
     pub(super) fn load(_: &SourceConfig, key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
-        let options = PasswordOptions::new_generic_password(SERVICE, &account(key));
+        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
+        options.set_access_synchronized(Some(false));
         let record = Zeroizing::new(passwords::generic_password(options)
             .map_err(|_| "No accessible saved Cadence certificate for this source; unlock the Keychain or import the selected PKCS#12")?);
         if record.len() > RECORD_HEADER.len() + 4 + MAX_PKCS12_BYTES + MAX_PASSWORD_BYTES {
@@ -561,11 +641,19 @@ mod secure_store {
         _: &str,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let record = load(config, key)?;
-        let (pkcs12, _) = decode_saved_record(&record)?;
-        Ok(Zeroizing::new(pkcs12.to_vec()))
+        if record.starts_with(RECORD_HEADER) {
+            // Old Cadence-owned entries remain readable; a user must still
+            // supply the password to unlock them in the current UI.
+            let (pkcs12, _) = decode_saved_record(&record)?;
+            Ok(Zeroizing::new(pkcs12.to_vec()))
+        } else {
+            Ok(record)
+        }
     }
     pub(super) fn remove(_: &SourceConfig, key: &CacheKey) -> Result<()> {
-        match passwords::delete_generic_password(SERVICE, &account(key)) {
+        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
+        options.set_access_synchronized(Some(false));
+        match passwords::delete_generic_password_options(options) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25300 => Ok(()),
             Err(_) => Err(
@@ -620,27 +708,7 @@ mod portable_store {
         pkcs12: &[u8],
         password: &str,
     ) -> Result<()> {
-        if password.is_empty() {
-            return Err(
-                "Set a nonempty certificate password before importing on this platform".into(),
-            );
-        }
-        let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
-            .map_err(|_| "Cannot unlock this PKCS#12 certificate")?;
-        let encrypted = Zeroizing::new(
-            store
-                .writer(password)
-                .encryption_iterations(100_000)
-                .mac_iterations(100_000)
-                .write()
-                .map_err(|_| "Cannot encrypt the imported certificate")?,
-        );
-        if encrypted.len() > MAX_PKCS12_BYTES {
-            return Err(
-                "Encrypted certificate exceeds the 4 MiB limit; previous import was retained"
-                    .into(),
-            );
-        }
+        let encrypted = encrypt_imported_pkcs12(pkcs12, password)?;
         let destination = path(config, key)?;
         let dir = destination
             .parent()
@@ -839,6 +907,22 @@ mod tests {
         let identity =
             decode_identity(&std::fs::read(path).unwrap(), "synthetic-test-only").unwrap();
         assert!(validate_identity(&identity).is_ok());
+    }
+    #[test]
+    fn encrypted_keychain_record_never_contains_the_password_and_unlocks_v1() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client-v1.p12");
+        let input = std::fs::read(fixture).unwrap();
+        let password = "synthetic-test-only";
+        assert!(encrypt_imported_pkcs12(&input, "").is_err());
+        let encrypted = encrypt_imported_pkcs12(&input, password).unwrap();
+        assert!(
+            !encrypted
+                .windows(password.len())
+                .any(|bytes| bytes == password.as_bytes())
+        );
+        assert!(decode_identity(&encrypted, "wrong-password").is_err());
+        assert!(validate_identity(&decode_identity(&encrypted, password).unwrap()).is_ok());
     }
     #[cfg(not(target_os = "scarlet"))]
     #[test]

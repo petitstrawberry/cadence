@@ -114,8 +114,9 @@ PNG / JPEG のカバーに対応し、画像とカタログのサイズには上
   サーバーがクライアント証明書を要求する場合は **Use a client certificate** を選び、
   **Set up / unlock certificate…** で PKCS#12 を選択し、パスワードを入力して
   **Import and connect** を押します。Cadence が証明書を所有し、元ファイルを移動しても使えます。
-  macOS では Cadence 専用 Keychain に保存し、**Unlock imported certificate** で再利用します。
-  それ以外では暗号化された PKCS#12 を Cadence のデータディレクトリーへ保存し、
+  macOS ではパスワードで暗号化した証明書だけを Cadence 専用のログイン Keychain 項目に保存し、
+  **Unlock imported certificate** でパスワードを入力して再利用します。パスワードは保存しません。
+  ほかの環境でも暗号化された PKCS#12 を Cadence のデータディレクトリーへ保存し、
   起動ごとにパスワードを入力して解除します。パスワード・秘密鍵の平文は設定 JSON に保存しません。
   **Remove imported certificate** で Cadence の保存分を削除できます。元ファイルは変更しません。
   保存済みの読み込みは明示的な操作で、自動同期では解除済みメモリーだけを使います。

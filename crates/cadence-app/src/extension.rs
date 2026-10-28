@@ -537,13 +537,8 @@ impl Workspace {
             return;
         }
         let request = if saved {
-            if cfg!(target_os = "macos") {
-                self.certificate_secret.clear();
-                IdentityRequest::Saved
-            } else {
-                IdentityRequest::Unlock {
-                    password: self.certificate_secret.take(),
-                }
+            IdentityRequest::Unlock {
+                password: self.certificate_secret.take(),
             }
         } else {
             let path = PathBuf::from(self.certificate_path.get().trim());
@@ -1630,6 +1625,7 @@ impl SourcesPane {
         let saved = workspace.clone();
         let forget = workspace.clone();
         let busy = workspace.source_authorizing.get().is_some();
+        let status_lines = certificate_status_lines(&workspace.source_status.get(), form_width);
         let actions = if busy {
             AnyView::new(caption("Certificate operation in progress…").frame(form_width, 36.))
         } else {
@@ -1657,12 +1653,18 @@ impl SourcesPane {
                 }.spacing(12.).frame(form_width,36.),
                 caption("Certificate password").alignment(Alignment::Leading).frame(form_width,20.),
                 workspace.certificate_secret.view(form_width),
-                caption(if cfg!(target_os = "macos") {
-                    "Import saves this identity in Cadence's Keychain storage."
-                } else { "Import stores an encrypted copy in Cadence. Enter its password to unlock." }).alignment(Alignment::Leading).frame(form_width,28.),
+                vstack! {
+                    caption(if cfg!(target_os = "macos") {
+                        "Password-encrypted in the login Keychain."
+                    } else { "A password-encrypted copy is stored in Cadence." }).alignment(Alignment::Leading).frame(form_width,20.),
+                    caption("Enter its password to unlock each session.").alignment(Alignment::Leading).frame(form_width,20.),
+                }.spacing(0.).frame(form_width,40.),
                 actions,
-                Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
-                    .alignment(Alignment::Leading).frame(form_width,60.).clip(),
+                vstack! {
+                    caption(status_lines[0].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
+                    caption(status_lines[1].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
+                    caption(status_lines[2].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
+                }.spacing(0.).frame(form_width,60.),
             }.spacing(10.).padding(20.).alignment(Alignment::TopLeading).frame(width,self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE),
         }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
     }
@@ -1923,6 +1925,26 @@ impl SourcesPane {
         }.spacing(0.),SurfaceRole::Canvas).frame(width,self.height))
     }
 }
+
+fn certificate_status_lines(message: &str, width: f32) -> [String; 3] {
+    let limit = ((width / 7.5) as usize).max(12);
+    let mut lines = [String::new(), String::new(), String::new()];
+    let mut line = 0;
+    for word in message.split_whitespace() {
+        let length = lines[line].chars().count();
+        if length > 0 && length + 1 + word.chars().count() > limit && line < 2 {
+            line += 1;
+        }
+        if !lines[line].is_empty() {
+            lines[line].push(' ');
+        }
+        lines[line].push_str(word);
+    }
+    for line in &mut lines {
+        *line = truncate(line, limit);
+    }
+    lines
+}
 impl View for SourcesPane {
     fn create_element(&self) -> Box<dyn Element> {
         Box::new(scarlet_ui::ComponentElement::new_with_builder(
@@ -2030,6 +2052,13 @@ impl Cadence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn certificate_status_wraps_keychain_error_without_hiding_status_code() {
+        let message = "Keychain import failed (OSStatus -50). Check Keychain access and retry.";
+        let lines = certificate_status_lines(message, 220.);
+        assert!(lines.join(" ").contains("OSStatus -50"));
+        assert!(lines[1..].iter().any(|line| !line.is_empty()));
+    }
     fn app() -> Cadence {
         Cadence::new(cadence_core::Player::new(Box::new(|| Err("No test output".into()))).unwrap())
     }
