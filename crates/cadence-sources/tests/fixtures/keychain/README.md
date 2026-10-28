@@ -20,6 +20,13 @@ The probe reports the Keychain deletion status. Inspect and remove the empty
 scratch directory after the run. It does not change Keychain settings.
 
 `item-limit-probe.c` uses the same temporary-Keychain approach to attempt
-noncredential zero-filled items of 1 KiB and slightly over 4 MiB. It reports
+noncredential zero-filled items of 0 bytes, 1 KiB and slightly over 4 MiB. It reports
 only sizes and OSStatus values, and deletes each item and its Keychain.
 Compile it with the same flags, changing the input C filename and output path.
+
+`pair-probe.c` stages two pairs and an active marker in a temporary Keychain,
+simulates a failure between staged writes, then verifies the old marker and a
+successful replacement. It exercises real Security framework add, lookup,
+update and delete calls, but the failure is injected by the test; it is not an
+OS access-denied or application-level Keychain test. It deletes all synthetic
+items and the temporary Keychain on normal completion.

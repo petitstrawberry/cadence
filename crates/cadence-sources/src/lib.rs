@@ -5,6 +5,8 @@
 //! media URLs are resolved lazily when playback or an explicit download starts.
 
 mod dlna;
+#[cfg(any(target_os = "macos", test))]
+mod identity_pair;
 mod kanade;
 mod kanade_tls;
 mod net;
@@ -225,6 +227,22 @@ impl SourceRegistry {
             return Err("This source does not support client certificates".into());
         }
         kanade_tls::Transport::import_client_identity(config, path, password, remember)
+    }
+    pub fn import_client_identity_cancellable(
+        &self,
+        config: &SourceConfig,
+        path: &Path,
+        password: &str,
+        remember: bool,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        self.plugin(config)?;
+        if config.plugin_id != "kanade" {
+            return Err("This source does not support client certificates".into());
+        }
+        kanade_tls::Transport::import_client_identity_cancellable(
+            config, path, password, remember, cancel,
+        )
     }
     /// Explicit user action only. Unlock this source's Cadence-owned secure
     /// store entry; background catalogue/media requests never read credentials.

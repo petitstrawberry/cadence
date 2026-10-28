@@ -474,9 +474,13 @@ impl LibraryState {
                         path,
                         password,
                         remember,
-                    } => {
-                        registry.import_client_identity(&config, &path, password.as_str(), remember)
-                    }
+                    } => registry.import_client_identity_cancellable(
+                        &config,
+                        &path,
+                        password.as_str(),
+                        remember,
+                        &cancel,
+                    ),
                     IdentityRequest::Saved => registry.authorize_saved_identity(&config),
                     IdentityRequest::Unlock { password } => {
                         registry.unlock_imported_identity(&config, password.as_str())
@@ -485,6 +489,12 @@ impl LibraryState {
                 };
                 if cancel.load(Ordering::Acquire) {
                     registry.forget_source_identity(&config.id);
+                    if let Err(error) = &result
+                        && error.contains("cleanup incomplete")
+                    {
+                        return self
+                            .event("Certificate import cancelled".into(), Some(error.clone()));
+                    }
                     // The native save may already have succeeded. Cancel only
                     // the connection; never claim stored credentials vanished.
                     return self.cancelled_identity_authorization(
@@ -492,6 +502,7 @@ impl LibraryState {
                             && (result.is_ok()
                                 || result.as_ref().err().is_some_and(|error| {
                                     error.starts_with("Certificate was saved in Cadence storage")
+                                        || error.starts_with("Import completed,")
                                 }))
                         {
                             IdentityPersistence::Saved

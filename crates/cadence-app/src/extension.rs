@@ -537,8 +537,11 @@ impl Workspace {
             return;
         }
         let request = if saved {
-            IdentityRequest::Unlock {
-                password: self.certificate_secret.take(),
+            let password = self.certificate_secret.take();
+            if cfg!(target_os = "macos") && password.is_empty() {
+                IdentityRequest::Saved
+            } else {
+                IdentityRequest::Unlock { password }
             }
         } else {
             let path = PathBuf::from(self.certificate_path.get().trim());
@@ -1655,9 +1658,9 @@ impl SourcesPane {
                 workspace.certificate_secret.view(form_width),
                 vstack! {
                     caption(if cfg!(target_os = "macos") {
-                        "Password-encrypted in the login Keychain."
+                        "Certificate and password use separate Keychain items."
                     } else { "A password-encrypted copy is stored in Cadence." }).alignment(Alignment::Leading).frame(form_width,20.),
-                    caption("Enter its password to unlock each session.").alignment(Alignment::Leading).frame(form_width,20.),
+                    caption(if cfg!(target_os = "macos") { "Protected by login Keychain; macOS may ask for access." } else { "Enter its password to unlock each session." }).alignment(Alignment::Leading).frame(form_width,20.),
                 }.spacing(0.).frame(form_width,40.),
                 actions,
                 vstack! {

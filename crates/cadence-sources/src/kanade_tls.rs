@@ -69,7 +69,25 @@ impl Transport {
         password: &str,
         remember: bool,
     ) -> Result<()> {
+        Self::import_client_identity_cancellable(
+            config,
+            path,
+            password,
+            remember,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub(crate) fn import_client_identity_cancellable(
+        config: &SourceConfig,
+        path: &Path,
+        password: &str,
+        remember: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
         require_certificate(config)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("Certificate import cancelled".into());
+        }
         let origin = identity_origin(config)?;
         if password.len() > MAX_PASSWORD_BYTES {
             return Err("Certificate password exceeds the size limit".into());
@@ -80,7 +98,7 @@ impl Transport {
             let identity = decode_identity(&pkcs12, password)?;
             validate_identity(&identity)?;
             if remember {
-                secure_store::save(config, &key, &pkcs12, password)?;
+                secure_store::save(config, &key, &pkcs12, password, cancel)?;
             }
             Ok(identity)
         })
@@ -557,18 +575,40 @@ mod secure_store {
         digest.update(key.1.as_bytes());
         format!("v1:{:x}", digest.finalize())
     }
-    pub(super) fn save(
-        _: &SourceConfig,
-        key: &CacheKey,
-        pkcs12: &[u8],
-        password: &str,
-    ) -> Result<()> {
-        let record = encrypt_imported_pkcs12(pkcs12, password)?;
-        // The macOS file-based Keychain rejects kSecAttrAccessControl and can
-        // ignore device-only accessibility attributes. Store only a separately
-        // password-encrypted PKCS#12, not the password, in the login Keychain.
-        // Keep add-only attributes out of the update query for safe replacement.
-        let name = account(key);
+    struct MacItems;
+    impl crate::identity_pair::ItemStore for MacItems {
+        fn get(&mut self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+            let mut options = PasswordOptions::new_generic_password(SERVICE, account);
+            options.set_access_synchronized(Some(false));
+            match passwords::generic_password(options) {
+                Ok(value) => Ok(Some(Zeroizing::new(value))),
+                Err(error) if error.code() == -25300 => Ok(None),
+                Err(error) => Err(format!(
+                    "Keychain read failed (OSStatus {}). Check Keychain access.",
+                    error.code()
+                )),
+            }
+        }
+        fn create(&mut self, account: &str, data: &[u8]) -> Result<()> {
+            write_item(account, data, false)
+        }
+        fn upsert(&mut self, account: &str, data: &[u8]) -> Result<()> {
+            write_item(account, data, true)
+        }
+        fn delete(&mut self, account: &str) -> Result<()> {
+            let mut options = PasswordOptions::new_generic_password(SERVICE, account);
+            options.set_access_synchronized(Some(false));
+            match passwords::delete_generic_password_options(options) {
+                Ok(()) => Ok(()),
+                Err(error) if error.code() == -25300 => Ok(()),
+                Err(error) => Err(format!(
+                    "Keychain removal failed (OSStatus {}). Check Keychain access.",
+                    error.code()
+                )),
+            }
+        }
+    }
+    fn write_item(account: &str, data: &[u8], replace: bool) -> Result<()> {
         let pairs: Vec<(CFString, CFType)> = unsafe {
             vec![
                 (
@@ -581,7 +621,7 @@ mod secure_store {
                 ),
                 (
                     CFString::wrap_under_get_rule(kSecAttrAccount),
-                    CFString::from(name.as_str()).into_CFType(),
+                    CFString::from(account).into_CFType(),
                 ),
                 (
                     CFString::wrap_under_get_rule(kSecAttrSynchronizable),
@@ -590,26 +630,34 @@ mod secure_store {
             ]
         };
         let mut add = pairs.clone();
+        let label = if account.ends_with(":password") {
+            "Cadence certificate password"
+        } else if account.ends_with(":certificate") {
+            "Cadence client certificate"
+        } else {
+            "Cadence certificate selection"
+        };
         unsafe {
             add.push((
                 CFString::wrap_under_get_rule(kSecAttrLabel),
-                CFString::from("Cadence client certificate").into_CFType(),
+                CFString::from(label).into_CFType(),
             ));
             add.push((
                 CFString::wrap_under_get_rule(kSecValueData),
-                CFData::from_buffer(&record).into_CFType(),
+                CFData::from_buffer(data).into_CFType(),
             ));
         }
         let attributes = CFDictionary::from_CFType_pairs(&add);
         let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut()) };
-        let status = if status == errSecDuplicateItem {
+        let status = if status == errSecDuplicateItem && replace {
             let query = CFDictionary::from_CFType_pairs(&pairs);
             let update = CFDictionary::from_CFType_pairs(&[unsafe {
                 (
                     CFString::wrap_under_get_rule(kSecValueData),
-                    CFData::from_buffer(&record).into_CFType(),
+                    CFData::from_buffer(data).into_CFType(),
                 )
             }]);
+            // Only update value data: never replace or lower an existing ACL.
             unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) }
         } else {
             status
@@ -622,44 +670,98 @@ mod secure_store {
             ))
         }
     }
-    pub(super) fn load(_: &SourceConfig, key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
-        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
-        options.set_access_synchronized(Some(false));
-        let record = Zeroizing::new(passwords::generic_password(options)
-            .map_err(|_| "No accessible saved Cadence certificate for this source; unlock the Keychain or import the selected PKCS#12")?);
-        if record.len() > RECORD_HEADER.len() + 4 + MAX_PKCS12_BYTES + MAX_PASSWORD_BYTES {
+    pub(super) fn save(
+        _: &SourceConfig,
+        key: &CacheKey,
+        pkcs12: &[u8],
+        password: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        use crate::identity_pair::{self, ItemStore};
+        // Re-encrypt even when the certificate password is empty. Both the
+        // certificate and its password are protected as separate items by the
+        // login Keychain; the password is never stored in application config.
+        let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
+            .map_err(pkcs12_error_message)?;
+        let encrypted = Zeroizing::new(
+            store
+                .writer(password)
+                .encryption_iterations(100_000)
+                .mac_iterations(100_000)
+                .write()
+                .map_err(|_| "Cannot encrypt the imported certificate")?,
+        );
+        if encrypted.len() > MAX_PKCS12_BYTES {
             return Err(
-                "Saved Cadence certificate exceeds the size limit; import the certificate again"
+                "Encrypted certificate exceeds the 4 MiB limit; previous import was retained"
                     .into(),
             );
         }
-        Ok(record)
+        let base = account(key);
+        let mut items = MacItems;
+        identity_pair::save_cancellable(
+            &mut items,
+            &base,
+            &encrypted,
+            password.as_bytes(),
+            cancel,
+        )?;
+        if items.delete(&base).is_err() {
+            return Err(
+                "Import completed, but the previous legacy Keychain item could not be removed"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn load(_: &SourceConfig, key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
+        use crate::identity_pair::{self, ItemStore};
+        let base = account(key);
+        let mut items = MacItems;
+        if let Some((certificate, password)) = identity_pair::load(&mut items, &base)? {
+            let password = std::str::from_utf8(&password).map_err(
+                |_| "Saved certificate password is invalid; import the certificate again",
+            )?;
+            return encode_saved_record(&certificate, password);
+        }
+        let old = items
+            .get(&base)?
+            .ok_or("No imported Cadence certificate found in Keychain")?;
+        if !old.starts_with(RECORD_HEADER) {
+            return Err("This older import needs its password; enter it to unlock".into());
+        }
+        Ok(old)
     }
     pub(super) fn load_imported(
         config: &SourceConfig,
         key: &CacheKey,
         _: &str,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let record = load(config, key)?;
+        use crate::identity_pair::{self, ItemStore};
+        let base = account(key);
+        let mut items = MacItems;
+        if let Some((certificate, _)) = identity_pair::load(&mut items, &base)? {
+            return Ok(certificate);
+        }
+        let record = items
+            .get(&base)?
+            .ok_or("No imported Cadence certificate found in Keychain")?;
         if record.starts_with(RECORD_HEADER) {
-            // Old Cadence-owned entries remain readable; a user must still
-            // supply the password to unlock them in the current UI.
             let (pkcs12, _) = decode_saved_record(&record)?;
             Ok(Zeroizing::new(pkcs12.to_vec()))
         } else {
+            let _ = config;
             Ok(record)
         }
     }
     pub(super) fn remove(_: &SourceConfig, key: &CacheKey) -> Result<()> {
-        let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
-        options.set_access_synchronized(Some(false));
-        match passwords::delete_generic_password_options(options) {
-            Ok(()) => Ok(()),
-            Err(error) if error.code() == -25300 => Ok(()),
-            Err(_) => Err(
-                "Cannot delete the saved Cadence certificate; unlock the Keychain and retry".into(),
-            ),
-        }
+        use crate::identity_pair::{self, ItemStore};
+        let base = account(key);
+        let mut items = MacItems;
+        identity_pair::remove(&mut items, &base)?;
+        items.delete(&base).map_err(|_| {
+            "Certificate removal is incomplete; some items may already have been removed".into()
+        })
     }
     #[test]
     fn credential_accounts_are_scoped_to_source_and_origin() {
@@ -707,6 +809,7 @@ mod portable_store {
         key: &CacheKey,
         pkcs12: &[u8],
         password: &str,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         let encrypted = encrypt_imported_pkcs12(pkcs12, password)?;
         let destination = path(config, key)?;
@@ -741,7 +844,15 @@ mod portable_store {
         let result = file
             .write_all(&encrypted)
             .and_then(|_| file.sync_all())
-            .and_then(|_| fs::rename(&temp, &destination));
+            .and_then(|_| {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ));
+                }
+                fs::rename(&temp, &destination)
+            });
         if result.is_err() {
             let _ = fs::remove_file(&temp);
             return Err(
@@ -857,11 +968,27 @@ mod tests {
             dir.join("owned").to_string_lossy().to_string().into();
         let key = cache_key(&source, &identity_origin(&source).unwrap());
         let data = read_pkcs12(&original).unwrap();
-        portable_store::save(&source, &key, &data, "test-fixture-only").unwrap();
+        portable_store::save(
+            &source,
+            &key,
+            &data,
+            "test-fixture-only",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         std::fs::remove_file(&original).unwrap();
         let imported = portable_store::load_imported(&source, &key, "test-fixture-only").unwrap();
         assert!(decode_identity(&imported, "test-fixture-only").is_ok());
-        assert!(portable_store::save(&source, &key, b"invalid", "test-fixture-only").is_err());
+        assert!(
+            portable_store::save(
+                &source,
+                &key,
+                b"invalid",
+                "test-fixture-only",
+                &std::sync::atomic::AtomicBool::new(false)
+            )
+            .is_err()
+        );
         assert!(
             decode_identity(
                 &portable_store::load_imported(&source, &key, "test-fixture-only").unwrap(),
@@ -870,7 +997,14 @@ mod tests {
             .is_ok()
         );
         assert!(decode_identity(&imported, "incorrect").is_err());
-        portable_store::save(&source, &key, &imported, "test-fixture-only").unwrap();
+        portable_store::save(
+            &source,
+            &key,
+            &imported,
+            "test-fixture-only",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(
             decode_identity(
                 &portable_store::load_imported(&source, &key, "test-fixture-only").unwrap(),
@@ -923,6 +1057,18 @@ mod tests {
         );
         assert!(decode_identity(&encrypted, "wrong-password").is_err());
         assert!(validate_identity(&decode_identity(&encrypted, password).unwrap()).is_ok());
+    }
+    #[test]
+    fn mac_keychain_import_can_retain_an_empty_certificate_password() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client.p12");
+        let bytes = std::fs::read(fixture).unwrap();
+        let source =
+            KeyStore::from_pkcs12(&bytes, "test-fixture-only", Pkcs12ImportPolicy::Strict).unwrap();
+        let empty_password_p12 = Zeroizing::new(source.writer("").write().unwrap());
+        let decoded =
+            KeyStore::from_pkcs12(&empty_password_p12, "", Pkcs12ImportPolicy::Strict).unwrap();
+        let reencoded = Zeroizing::new(decoded.writer("").write().unwrap());
+        assert!(decode_identity(&reencoded, "").is_ok());
     }
     #[cfg(not(target_os = "scarlet"))]
     #[test]
