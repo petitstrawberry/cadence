@@ -112,16 +112,13 @@ PNG / JPEG のカバーに対応し、画像とカタログのサイズには上
   シークや次の HTTP Range 要求で署名を再取得するため、長時間の再生・一時停止にも対応します。
   署名 URL やサーバー上のファイルパスはカタログに保存しません。
   サーバーがクライアント証明書を要求する場合は **Use a client certificate** を選び、
-  ソース画面の **Set up / unlock certificate…** で自分の PKCS#12（`.p12` / `.pfx`）を
-  選択します。マスクされたパスワード欄に入力し、**Unlock and connect** で接続します。
-  他のアプリの設定や証明書には依存しません。選択したファイルへの参照はソース設定に残りますが、
-  パスワード・秘密鍵を `app.json` やカタログへ保存しません。通常はアプリの起動ごとに
-  ファイルを明示的に読み込み、解除した証明書をそのセッションのメモリー内で使用します。
-  macOS では必要な場合だけ **Save in Cadence's Keychain storage** を選び、証明書と
-  パスワードを Cadence 専用の Keychain 項目へ保存できます。保存済みの証明書は
-  **Unlock saved certificate** で読み込み、**Delete saved certificate** で削除します。
-  どちらも明示的な操作で、自動同期や起動時に Keychain を読み取ったり承認画面を表示したりしません。
-  ファイルからの読み込みとセッション内の証明書管理は OS の Keychain に依存しない共通処理です。
+  **Set up / unlock certificate…** で PKCS#12 を選択し、パスワードを入力して
+  **Import and connect** を押します。Cadence が証明書を所有し、元ファイルを移動しても使えます。
+  macOS では Cadence 専用 Keychain に保存し、**Unlock imported certificate** で再利用します。
+  それ以外では暗号化された PKCS#12 を Cadence のデータディレクトリーへ保存し、
+  起動ごとにパスワードを入力して解除します。パスワード・秘密鍵の平文は設定 JSON に保存しません。
+  **Remove imported certificate** で Cadence の保存分を削除できます。元ファイルは変更しません。
+  保存済みの読み込みは明示的な操作で、自動同期では解除済みメモリーだけを使います。
   証明書を送る先は設定した HTTPS origin に限定し、別の origin へのリダイレクトは拒否します。
   HTTP 401/403 の場合はソース画面に接続条件を確認するメッセージを表示します。
   Kanade 自体にユーザー名・パスワードのログイン API はありません。

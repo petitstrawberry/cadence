@@ -235,6 +235,14 @@ impl SourceRegistry {
         }
         kanade_tls::Transport::authorize_saved_identity(config)
     }
+    /// Unlock an already imported identity without accessing its original file.
+    pub fn unlock_imported_identity(&self, config: &SourceConfig, password: &str) -> Result<()> {
+        self.plugin(config)?;
+        if config.plugin_id != "kanade" {
+            return Err("This source does not support client certificates".into());
+        }
+        kanade_tls::Transport::unlock_imported_identity(config, password)
+    }
     /// Explicit user action only. Delete this source/origin's saved Cadence
     /// credential and forget its session. The selected PKCS#12 file is retained.
     pub fn remove_saved_identity(&self, config: &SourceConfig) -> Result<()> {

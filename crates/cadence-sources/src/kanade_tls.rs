@@ -71,9 +71,6 @@ impl Transport {
     ) -> Result<()> {
         require_certificate(config)?;
         let origin = identity_origin(config)?;
-        if remember && !cfg!(target_os = "macos") {
-            return Err("Secure credential storage is not available on this platform; unlock the selected PKCS#12 for this session without Remember".into());
-        }
         if password.len() > MAX_PASSWORD_BYTES {
             return Err("Certificate password exceeds the size limit".into());
         }
@@ -83,7 +80,7 @@ impl Transport {
             let identity = decode_identity(&pkcs12, password)?;
             validate_identity(&identity)?;
             if remember {
-                secure_store::save(&key, &pkcs12, password)?;
+                secure_store::save(config, &key, &pkcs12, password)?;
             }
             Ok(identity)
         })
@@ -96,7 +93,7 @@ impl Transport {
         let origin = identity_origin(config)?;
         let key = cache_key(config, &origin);
         store_authorized_identity(key.clone(), false, || {
-            let record = secure_store::load(&key)?;
+            let record = secure_store::load(config, &key)?;
             let (pkcs12, password) = decode_saved_record(&record)?;
             let identity = decode_identity(pkcs12, password)?;
             validate_identity(&identity)?;
@@ -107,13 +104,26 @@ impl Transport {
 
     /// Explicit user action; deletes only this source/origin's Cadence-owned
     /// secure-store entry. It never removes the user-selected certificate file.
+    pub(crate) fn unlock_imported_identity(config: &SourceConfig, password: &str) -> Result<()> {
+        require_certificate(config)?;
+        let origin = identity_origin(config)?;
+        let key = cache_key(config, &origin);
+        store_authorized_identity(key.clone(), false, || {
+            let record = secure_store::load_imported(config, &key, password)?;
+            let identity = decode_identity(&record, password)?;
+            validate_identity(&identity)?;
+            Ok(identity)
+        })
+        .map(|_| ())
+    }
+
     pub(crate) fn remove_saved_identity(config: &SourceConfig) -> Result<()> {
         if config.id.is_empty() {
             return Err("Source instance ID must not be empty".into());
         }
         let origin = identity_origin(config)?;
         Self::forget_source(&config.id);
-        secure_store::remove(&cache_key(config, &origin))
+        secure_store::remove(config, &cache_key(config, &origin))
     }
 
     /// Clears process-memory authorization only. A user's selected file and
@@ -318,7 +328,7 @@ fn store_authorized_identity(
     let mut cache = identity_cache().lock().unwrap_or_else(|e| e.into_inner());
     if source_generation.load(Ordering::Relaxed) != generation {
         return Err(if remembers_on_success {
-            "Certificate was saved in Cadence Keychain, but this source changed while it was being unlocked. New connections remain locked; unlock the saved certificate again if needed"
+            "Certificate was saved in Cadence storage, but this source changed while it was being unlocked. New connections remain locked; unlock the saved certificate again if needed"
         } else {
             "Source configuration changed while unlocking the certificate; retry the source"
         }.into());
@@ -335,9 +345,8 @@ fn decode_identity(pkcs12: &[u8], password: &str) -> Result<IdentityMaterial> {
     if pkcs12.len() > MAX_PKCS12_BYTES || password.len() > MAX_PASSWORD_BYTES {
         return Err("Certificate or password exceeds the size limit".into());
     }
-    let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict).map_err(
-        |_| "Cannot unlock this PKCS#12 certificate; check the selected file and password",
-    )?;
+    let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
+        .map_err(pkcs12_error_message)?;
     let mut identities = store.entries().filter_map(|(_, entry)| match entry {
         KeyStoreEntry::PrivateKeyChain(chain) => Some(chain),
         _ => None,
@@ -359,6 +368,22 @@ fn decode_identity(pkcs12: &[u8], password: &str) -> Result<IdentityMaterial> {
             .collect(),
         private_key: Zeroizing::new(identity.key().as_der().to_vec()),
     })
+}
+
+fn pkcs12_error_message(error: p12_keystore::error::Error) -> &'static str {
+    use p12_keystore::error::Error;
+    match error {
+        Error::UnsupportedEncryptionScheme | Error::UnsupportedMacAlgorithm => {
+            "This PKCS#12 uses an unsupported encryption or integrity algorithm"
+        }
+        Error::InvalidPrivateKey => {
+            "The PKCS#12 private key is invalid or uses an unsupported format"
+        }
+        Error::MacError(_) | Error::UnpadError => {
+            "Cannot verify or decrypt the PKCS#12; the password may be wrong or the file may be damaged"
+        }
+        _ => "Cannot parse or unlock this PKCS#12; check the file format and password",
+    }
 }
 
 fn validate_identity(identity: &IdentityMaterial) -> Result<()> {
@@ -398,7 +423,13 @@ fn tls_config(
         .map_err(|_| "Cannot configure TLS protocols")?
         .with_root_certificates(roots)
         .with_client_auth_cert(certificates, key)
-        .map_err(|_| "Client certificate and private key are invalid or unsupported".into())
+        .map_err(|error| match error {
+            rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch) =>
+                "The client certificate does not match its private key; choose a PKCS#12 with the matching pair".into(),
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented =>
+                "The client certificate is missing or cannot be parsed".into(),
+            _ => "The private key format or algorithm is not supported by Cadence's TLS provider".into(),
+        })
 }
 
 const RECORD_HEADER: &[u8] = b"CadenceIdentity1";
@@ -459,7 +490,12 @@ mod secure_store {
         digest.update(key.1.as_bytes());
         format!("v1:{:x}", digest.finalize())
     }
-    pub(super) fn save(key: &CacheKey, pkcs12: &[u8], password: &str) -> Result<()> {
+    pub(super) fn save(
+        _: &SourceConfig,
+        key: &CacheKey,
+        pkcs12: &[u8],
+        password: &str,
+    ) -> Result<()> {
         let record = encode_saved_record(pkcs12, password)?;
         let mut options = PasswordOptions::new_generic_password(SERVICE, &account(key));
         options.set_label("Cadence client certificate");
@@ -474,7 +510,7 @@ mod secure_store {
         passwords::set_generic_password_options(&record, options)
             .map_err(|_| "Cannot remember this certificate in Cadence's Keychain storage; retry without Remember to use this session only".into())
     }
-    pub(super) fn load(key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
+    pub(super) fn load(_: &SourceConfig, key: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
         let options = PasswordOptions::new_generic_password(SERVICE, &account(key));
         let record = Zeroizing::new(passwords::generic_password(options)
             .map_err(|_| "No accessible saved Cadence certificate for this source; unlock the Keychain or import the selected PKCS#12")?);
@@ -486,7 +522,16 @@ mod secure_store {
         }
         Ok(record)
     }
-    pub(super) fn remove(key: &CacheKey) -> Result<()> {
+    pub(super) fn load_imported(
+        config: &SourceConfig,
+        key: &CacheKey,
+        _: &str,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let record = load(config, key)?;
+        let (pkcs12, _) = decode_saved_record(&record)?;
+        Ok(Zeroizing::new(pkcs12.to_vec()))
+    }
+    pub(super) fn remove(_: &SourceConfig, key: &CacheKey) -> Result<()> {
         match passwords::delete_generic_password(SERVICE, &account(key)) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25300 => Ok(()),
@@ -508,19 +553,123 @@ mod secure_store {
         assert!(SERVICE.contains("cadence"));
     }
 }
-#[cfg(not(target_os = "macos"))]
-mod secure_store {
+#[cfg(any(not(target_os = "macos"), test))]
+#[allow(dead_code)]
+mod portable_store {
     use super::*;
-    pub(super) fn save(_: &CacheKey, _: &[u8], _: &str) -> Result<()> {
-        Err("Secure certificate persistence is unavailable on this platform".into())
+    use sha2::{Digest, Sha256};
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        path::PathBuf,
+        sync::atomic::AtomicU64,
+    };
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    fn path(config: &SourceConfig, key: &CacheKey) -> Result<PathBuf> {
+        let directory = config
+            .settings
+            .get("credential_store")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Cadence credential storage is unavailable")?;
+        let directory = PathBuf::from(directory);
+        if !directory.is_absolute() {
+            return Err("Cadence credential storage path must be absolute".into());
+        }
+        let mut digest = Sha256::new();
+        digest.update((key.0.len() as u64).to_be_bytes());
+        digest.update(key.0.as_bytes());
+        digest.update(key.1.as_bytes());
+        Ok(directory.join(format!("{:x}.p12", digest.finalize())))
     }
-    pub(super) fn load(_: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
-        Err("Unlock the selected PKCS#12 with its password for this session; secure certificate persistence is unavailable on this platform".into())
+    pub(super) fn save(
+        config: &SourceConfig,
+        key: &CacheKey,
+        pkcs12: &[u8],
+        password: &str,
+    ) -> Result<()> {
+        if password.is_empty() {
+            return Err(
+                "Set a nonempty certificate password before importing on this platform".into(),
+            );
+        }
+        let store = KeyStore::from_pkcs12(pkcs12, password, Pkcs12ImportPolicy::Strict)
+            .map_err(|_| "Cannot unlock this PKCS#12 certificate")?;
+        let encrypted = Zeroizing::new(
+            store
+                .writer(password)
+                .encryption_iterations(100_000)
+                .mac_iterations(100_000)
+                .write()
+                .map_err(|_| "Cannot encrypt the imported certificate")?,
+        );
+        if encrypted.len() > MAX_PKCS12_BYTES {
+            return Err(
+                "Encrypted certificate exceeds the 4 MiB limit; previous import was retained"
+                    .into(),
+            );
+        }
+        let destination = path(config, key)?;
+        let dir = destination
+            .parent()
+            .ok_or("Invalid credential storage path")?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(dir)
+            .map_err(|_| "Cannot create Cadence credential storage")?;
+        let temp = dir.join(format!(
+            ".import-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|_| "Cannot create a temporary certificate import")?;
+        let result = file
+            .write_all(&encrypted)
+            .and_then(|_| file.sync_all())
+            .and_then(|_| fs::rename(&temp, &destination));
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+            return Err(
+                "Cannot save the imported certificate; previous import was retained".into(),
+            );
+        }
+        Ok(())
     }
-    pub(super) fn remove(_: &CacheKey) -> Result<()> {
-        Err("This platform does not persist client certificates in a secure store".into())
+    pub(super) fn load(_: &SourceConfig, _: &CacheKey) -> Result<Zeroizing<Vec<u8>>> {
+        Err("Enter the password to unlock the imported certificate".into())
+    }
+    pub(super) fn load_imported(
+        config: &SourceConfig,
+        key: &CacheKey,
+        _: &str,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        read_pkcs12(&path(config, key)?)
+    }
+    pub(super) fn remove(config: &SourceConfig, key: &CacheKey) -> Result<()> {
+        match fs::remove_file(path(config, key)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Cannot remove the imported certificate".into()),
+        }
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+use portable_store as secure_store;
 
 #[cfg(all(test, not(target_os = "scarlet")))]
 #[path = "kanade_tls_tests.rs"]
@@ -537,6 +686,17 @@ mod tests {
             plugin_id: "kanade".into(),
             settings: json!({"url":"https://example.invalid", "client_certificate":true}),
         }
+    }
+    #[test]
+    fn pkcs12_failure_messages_distinguish_unsupported_encryption_and_invalid_key() {
+        use p12_keystore::error::Error;
+        assert!(
+            pkcs12_error_message(Error::UnsupportedEncryptionScheme)
+                .contains("unsupported encryption")
+        );
+        assert!(pkcs12_error_message(Error::UnsupportedMacAlgorithm).contains("integrity"));
+        assert!(pkcs12_error_message(Error::InvalidPrivateKey).contains("private key"));
+        assert!(pkcs12_error_message(Error::UnpadError).contains("password may be wrong"));
     }
     #[test]
     fn certificate_file_errors_explain_empty_directory_missing_and_oversize() {
@@ -573,6 +733,72 @@ mod tests {
             assert!(read_pkcs12(&link).unwrap_err().contains("empty (0 bytes)"));
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn encrypted_import_survives_source_removal_and_failed_replacement() {
+        let dir = std::env::temp_dir().join(format!(
+            "cadence-import-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let original = dir.join("original.p12");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls/client.p12"),
+            &original,
+        )
+        .unwrap();
+        let mut source = config("portable-durable");
+        source.settings["credential_store"] =
+            dir.join("owned").to_string_lossy().to_string().into();
+        let key = cache_key(&source, &identity_origin(&source).unwrap());
+        let data = read_pkcs12(&original).unwrap();
+        portable_store::save(&source, &key, &data, "test-fixture-only").unwrap();
+        std::fs::remove_file(&original).unwrap();
+        let imported = portable_store::load_imported(&source, &key, "test-fixture-only").unwrap();
+        assert!(decode_identity(&imported, "test-fixture-only").is_ok());
+        assert!(portable_store::save(&source, &key, b"invalid", "test-fixture-only").is_err());
+        assert!(
+            decode_identity(
+                &portable_store::load_imported(&source, &key, "test-fixture-only").unwrap(),
+                "test-fixture-only"
+            )
+            .is_ok()
+        );
+        assert!(decode_identity(&imported, "incorrect").is_err());
+        portable_store::save(&source, &key, &imported, "test-fixture-only").unwrap();
+        assert!(
+            decode_identity(
+                &portable_store::load_imported(&source, &key, "test-fixture-only").unwrap(),
+                "test-fixture-only"
+            )
+            .is_ok()
+        );
+        portable_store::remove(&source, &key).unwrap();
+        assert!(portable_store::load_imported(&source, &key, "test-fixture-only").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    #[test]
+    fn tls_identity_errors_distinguish_mismatched_certificate_and_bad_key() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mtls");
+        let pkcs12 = std::fs::read(fixture.join("client.p12")).unwrap();
+        let mut identity = decode_identity(&pkcs12, "test-fixture-only").unwrap();
+        identity.certificates = vec![std::fs::read(fixture.join("server.der")).unwrap()];
+        assert!(
+            validate_identity(&identity)
+                .unwrap_err()
+                .contains("does not match")
+        );
+        identity.private_key = Zeroizing::new(vec![1, 2, 3]);
+        assert!(
+            validate_identity(&identity)
+                .unwrap_err()
+                .contains("private key format or algorithm")
+        );
     }
     #[test]
     fn credentials_are_opt_in_and_legacy_imports_require_migration() {
@@ -626,7 +852,7 @@ mod tests {
             .err()
             .unwrap();
             assert!(cached_identity(&key).is_err());
-            assert_eq!(error.contains("was saved in Cadence Keychain"), remembered);
+            assert_eq!(error.contains("was saved in Cadence storage"), remembered);
         }
     }
     #[test]

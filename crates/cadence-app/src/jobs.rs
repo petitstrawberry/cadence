@@ -42,6 +42,9 @@ pub enum IdentityRequest {
         remember: bool,
     },
     Saved,
+    Unlock {
+        password: zeroize::Zeroizing<String>,
+    },
     RemoveSaved,
 }
 #[derive(Clone, Copy)]
@@ -60,6 +63,7 @@ impl std::fmt::Debug for IdentityRequest {
                 .field("remember", remember)
                 .finish(),
             Self::Saved => formatter.write_str("Saved"),
+            Self::Unlock { .. } => formatter.write_str("Unlock { password: [REDACTED] }"),
             Self::RemoveSaved => formatter.write_str("RemoveSaved"),
         }
     }
@@ -442,14 +446,15 @@ impl LibraryState {
                     return self.event("Source removal failed · Library unchanged".into(), Some("Certificate cleanup configuration does not match this Kanade source; source and library retained".into()));
                 }
                 return self.remove_source_with_cleanup(&source, || {
-                    #[cfg(target_os = "macos")]
                     if let Some(config) = credential_config {
+                        #[cfg(not(target_os = "macos"))]
+                        if config.settings.get("credential_store").is_none() {
+                            return Ok(false);
+                        }
                         cadence_sources::SourceRegistry::builtin()
                             .remove_saved_identity(&config)?;
                         return Ok(true);
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    let _ = credential_config;
                     Ok(false)
                 });
             }
@@ -473,19 +478,29 @@ impl LibraryState {
                         registry.import_client_identity(&config, &path, password.as_str(), remember)
                     }
                     IdentityRequest::Saved => registry.authorize_saved_identity(&config),
+                    IdentityRequest::Unlock { password } => {
+                        registry.unlock_imported_identity(&config, password.as_str())
+                    }
                     IdentityRequest::RemoveSaved => registry.remove_saved_identity(&config),
                 };
                 if cancel.load(Ordering::Acquire) {
                     registry.forget_source_identity(&config.id);
                     // The native save may already have succeeded. Cancel only
                     // the connection; never claim stored credentials vanished.
-                    return self.cancelled_identity_authorization(if result.is_ok() && remember {
-                        IdentityPersistence::Saved
-                    } else if result.is_ok() && remove_saved {
-                        IdentityPersistence::Removed
-                    } else {
-                        IdentityPersistence::Unchanged
-                    });
+                    return self.cancelled_identity_authorization(
+                        if remember
+                            && (result.is_ok()
+                                || result.as_ref().err().is_some_and(|error| {
+                                    error.starts_with("Certificate was saved in Cadence storage")
+                                }))
+                        {
+                            IdentityPersistence::Saved
+                        } else if result.is_ok() && remove_saved {
+                            IdentityPersistence::Removed
+                        } else {
+                            IdentityPersistence::Unchanged
+                        },
+                    );
                 }
                 return match result {
                     Ok(()) => self.event(
@@ -589,7 +604,7 @@ impl LibraryState {
     fn cancelled_identity_authorization(&self, persistence: IdentityPersistence) -> LibraryEvent {
         let message = match persistence {
             IdentityPersistence::Saved => {
-                "Connection cancelled; certificate was saved in Cadence Keychain"
+                "Connection cancelled; certificate was saved in Cadence storage"
             }
             IdentityPersistence::Removed => "Saved certificate removed; connection cancelled",
             IdentityPersistence::Unchanged => "Certificate authorization cancelled",
@@ -938,7 +953,7 @@ mod tests {
         let saved = state.cancelled_identity_authorization(IdentityPersistence::Saved);
         assert_eq!(
             saved.error.as_deref(),
-            Some("Connection cancelled; certificate was saved in Cadence Keychain")
+            Some("Connection cancelled; certificate was saved in Cadence storage")
         );
         assert_eq!(saved.tracks, vec![track("existing")]);
         let not_saved = state.cancelled_identity_authorization(IdentityPersistence::Unchanged);

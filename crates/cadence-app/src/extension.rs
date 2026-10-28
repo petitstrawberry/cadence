@@ -406,7 +406,8 @@ impl Workspace {
                 self.cancel_source_sync(Some(&id));
                 let credential_config = self.selected_source().filter(|source| {
                     source.plugin_id == "kanade"
-                        && source.settings.get("certificate_path").is_some()
+                        && (source.settings.get("credential_store").is_some()
+                            || source.settings.get("certificate_path").is_some())
                 });
                 LibraryCommand::RemoveSource {
                     source: id,
@@ -536,8 +537,14 @@ impl Workspace {
             return;
         }
         let request = if saved {
-            self.certificate_secret.clear();
-            IdentityRequest::Saved
+            if cfg!(target_os = "macos") {
+                self.certificate_secret.clear();
+                IdentityRequest::Saved
+            } else {
+                IdentityRequest::Unlock {
+                    password: self.certificate_secret.take(),
+                }
+            }
         } else {
             let path = PathBuf::from(self.certificate_path.get().trim());
             if !path.is_absolute() {
@@ -545,11 +552,21 @@ impl Workspace {
                     .set("Choose a PKCS#12 file or enter its absolute path".into());
                 return;
             }
-            config.settings["certificate_path"] = path.to_string_lossy().into_owned().into();
+            config
+                .settings
+                .as_object_mut()
+                .unwrap()
+                .remove("certificate_path");
+            config.settings["credential_store"] = self
+                .directory
+                .join("credentials")
+                .to_string_lossy()
+                .into_owned()
+                .into();
             IdentityRequest::Import {
                 path,
                 password: self.certificate_secret.take(),
-                remember: cfg!(target_os = "macos") && self.certificate_remember.get(),
+                remember: true,
             }
         };
         self.certificate_removing.set(false);
@@ -562,8 +579,7 @@ impl Workspace {
         else {
             return;
         };
-        if !cfg!(target_os = "macos")
-            || self.source_authorizing.get().is_some()
+        if self.source_authorizing.get().is_some()
             || self.pending_removals.borrow().contains(&config.id)
             || self.read_only.get()
             || !self.config_writable
@@ -1618,14 +1634,14 @@ impl SourcesPane {
             AnyView::new(caption("Certificate operation in progress…").frame(form_width, 36.))
         } else {
             AnyView::new(vstack! {
-                button("Unlock and connect").on_click(move || unlock.authorize_kanade_identity(false)).frame(180.,32.)
+                button("Import and connect").on_click(move || unlock.authorize_kanade_identity(false)).frame(180.,32.)
                     .alignment(Alignment::Leading).frame(form_width,36.),
-                if cfg!(target_os = "macos") {
+                {
                     AnyView::new(hstack! {
-                        button("Unlock saved certificate").header_style().on_click(move || saved.authorize_kanade_identity(true)).frame(200.,32.),
-                        button("Delete saved certificate").header_style().on_click(move || forget.remove_saved_certificate()).frame(200.,32.),
+                        button("Unlock imported certificate").header_style().on_click(move || saved.authorize_kanade_identity(true)).frame(200.,32.),
+                        button("Remove imported certificate").header_style().on_click(move || forget.remove_saved_certificate()).frame(200.,32.),
                     }.spacing(8.).alignment(Alignment::Leading).frame(form_width,36.))
-                } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+                },
             }.spacing(8.))
         };
         AnyView::new(Surface::new(vstack! {
@@ -1641,15 +1657,9 @@ impl SourcesPane {
                 }.spacing(12.).frame(form_width,36.),
                 caption("Certificate password").alignment(Alignment::Leading).frame(form_width,20.),
                 workspace.certificate_secret.view(form_width),
-                if cfg!(target_os = "macos") {
-                    AnyView::new(hstack! {
-                        Toggle::new(workspace.certificate_remember.clone()).frame(36.,22.),
-                        caption("Save in Cadence's Keychain storage").alignment(Alignment::Leading).frame(form_width-48.,32.),
-                    }.spacing(12.).frame(form_width,32.))
-                } else { AnyView::new(Spacer::new().frame(0.,0.)) },
-                caption(if workspace.certificate_remember.get() && cfg!(target_os = "macos") {
-                    "The certificate and password will be stored securely for Cadence."
-                } else { "The password stays in memory for this session only." }).alignment(Alignment::Leading).frame(form_width,28.),
+                caption(if cfg!(target_os = "macos") {
+                    "Import saves this identity in Cadence's Keychain storage."
+                } else { "Import stores an encrypted copy in Cadence. Enter its password to unlock." }).alignment(Alignment::Leading).frame(form_width,28.),
                 actions,
                 Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
                     .alignment(Alignment::Leading).frame(form_width,60.).clip(),
