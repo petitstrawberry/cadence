@@ -224,12 +224,31 @@ fn read_pkcs12(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     if !path.is_absolute() {
         return Err("Choose an absolute path to a PKCS#12 certificate file".into());
     }
-    let file = File::open(path).map_err(|_| "Cannot open the selected certificate file")?;
+    let file = File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "Certificate file not found; choose an existing .p12 or .pfx file"
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "Cannot access the certificate file; check its permissions"
+        }
+        _ => "Cannot open the selected certificate file",
+    })?;
     let metadata = file
         .metadata()
         .map_err(|_| "Cannot inspect the selected certificate file")?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PKCS12_BYTES as u64 {
-        return Err("Certificate must be a nonempty regular PKCS#12 file of at most 4 MiB".into());
+    if !metadata.is_file() {
+        return Err(
+            "The selected certificate is not a regular file; choose a .p12 or .pfx file".into(),
+        );
+    }
+    if metadata.len() == 0 {
+        return Err(
+            "The selected certificate file is empty (0 bytes); choose a nonempty .p12 or .pfx file"
+                .into(),
+        );
+    }
+    if metadata.len() > MAX_PKCS12_BYTES as u64 {
+        return Err("Certificate file exceeds the 4 MiB limit".into());
     }
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_PKCS12_BYTES as u64 + 1)
@@ -237,6 +256,12 @@ fn read_pkcs12(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
         .map_err(|_| "Cannot read the selected certificate file")?;
     if bytes.len() > MAX_PKCS12_BYTES {
         return Err("Certificate file exceeds the 4 MiB limit".into());
+    }
+    if bytes.is_empty() {
+        return Err(
+            "The selected certificate file is empty (0 bytes); choose a nonempty .p12 or .pfx file"
+                .into(),
+        );
     }
     Ok(bytes)
 }
@@ -512,6 +537,42 @@ mod tests {
             plugin_id: "kanade".into(),
             settings: json!({"url":"https://example.invalid", "client_certificate":true}),
         }
+    }
+    #[test]
+    fn certificate_file_errors_explain_empty_directory_missing_and_oversize() {
+        let dir = std::env::temp_dir().join(format!(
+            "cadence-cert-metadata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let empty = dir.join("empty.p12");
+        std::fs::write(&empty, []).unwrap();
+        assert!(read_pkcs12(&empty).unwrap_err().contains("empty (0 bytes)"));
+        assert!(
+            read_pkcs12(&dir)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        assert!(
+            read_pkcs12(&dir.join("missing.p12"))
+                .unwrap_err()
+                .contains("not found")
+        );
+        let large = dir.join("large.p12");
+        let file = File::create(&large).unwrap();
+        file.set_len(MAX_PKCS12_BYTES as u64 + 1).unwrap();
+        assert!(read_pkcs12(&large).unwrap_err().contains("4 MiB"));
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.p12");
+            std::os::unix::fs::symlink(&empty, &link).unwrap();
+            assert!(read_pkcs12(&link).unwrap_err().contains("empty (0 bytes)"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn credentials_are_opt_in_and_legacy_imports_require_migration() {
