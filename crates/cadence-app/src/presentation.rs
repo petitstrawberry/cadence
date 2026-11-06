@@ -1,6 +1,8 @@
 //! Independent presentation boundaries. None forwards descendant listenables.
 use super::*;
 
+const SIDEBAR_WIDTH: f32 = 184.;
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct BuildCounts {
@@ -60,6 +62,9 @@ impl NavigationFrame {
                         app: self.app.clone(),
                     }
                     .repaint_boundary()
+                    // Measure the allocated pane, not the page's previous
+                    // fixed height, so growing the window can update it.
+                    .frame(f32::INFINITY, f32::INFINITY)
                     .on_geometry_change(
                         |g| g.size(),
                         move |size| {
@@ -109,13 +114,13 @@ struct MainColumn {
 impl MainColumn {
     fn page(&self, tab: Tab) -> AnyView {
         let size = self.app.shell.primary_size.get();
-        let width = (size.width - 184.).max(500.);
+        let width = (size.width - SIDEBAR_WIDTH).max(500.) + CHROME_MARGIN;
         let height = size.height;
         let content = if self.app.browser.visible.get() {
             AnyView::new(BrowserFrame {
                 app: self.app.clone(),
                 width,
-                height: height - PLAYER_CLEARANCE,
+                height,
             })
         } else {
             match tab {
@@ -141,26 +146,37 @@ impl MainColumn {
                 Tab::Effects => {
                     if let Some(effects) = &self.app.effects {
                         let app = self.app.clone();
-                        effects.view(
-                            width,
-                            height - PLAYER_CLEARANCE,
-                            Rc::new(move || app.open_effect()),
+                        AnyView::new(
+                            effects
+                                .view(
+                                    width,
+                                    height - PLAYER_CLEARANCE,
+                                    Rc::new(move || app.open_effect()),
+                                )
+                                .safe_area_padding(SafeAreaEdges::ALL),
                         )
                     } else {
-                        AnyView::new(caption("Effects are unavailable").frame(width, height))
+                        AnyView::new(
+                            caption("Effects are unavailable")
+                                .frame(width, height - PLAYER_CLEARANCE)
+                                .safe_area_padding(SafeAreaEdges::ALL),
+                        )
                     }
                 }
             }
         };
-        AnyView::new(
+        let player_width = player_width(width - CHROME_MARGIN);
+        AnyView::new(Surface::new(
             scarlet_ui::zstack! {
-                content.repaint_boundary().alignment(Alignment::Top).frame(width,height),
-                TransportFrame { app: self.app.clone(), width: player_width(width) }.repaint_boundary()
-                    .frame(player_width(width),64.).padding_insets(EdgeInsets::new(0.,0.,0.,12.)),
+                main_content(content).repaint_boundary().alignment(Alignment::Top).frame(f32::INFINITY,height),
+                TransportFrame { app: self.app.clone(), width: player_width }.repaint_boundary()
+                    .frame(player_width,PLAYER_HEIGHT).padding_insets(EdgeInsets::only_bottom(PLAYER_BOTTOM_MARGIN))
+                    .safe_area_padding(SafeAreaEdges::LEFT | SafeAreaEdges::RIGHT),
             }
             .alignment(Alignment::Bottom)
-            .frame(width, size.height),
-        )
+            .frame(f32::INFINITY, size.height),
+            SurfaceRole::Canvas,
+        ))
     }
     fn link(&self, title: &str, icon: Icon, tab: Tab) -> NavigationLink {
         let page = self.clone();
@@ -193,7 +209,10 @@ impl MainColumn {
             self.link("Sources", Icon::Folder, Tab::Sources),
             self.link("Effects", Icon::Adjustments, Tab::Effects),
         ))
-        .sidebar_width(184.)
+        .sidebar_width(SIDEBAR_WIDTH)
+        // The canvas reaches the window edge; descendants reserve the full
+        // sidebar width for controls and other meaningful content.
+        .content_underlap(SIDEBAR_WIDTH)
         .shows_icons(true)
         .presentation(NavigationPresentation::Sidebar);
         let index = match self.app.workspace.tab.get() {
@@ -237,13 +256,13 @@ impl QueueSidebar {
         let close = self.app.clone();
         let current = self.app.playback.queue.current.clone();
         let count = self.app.playback.queue.tracks.get().len();
-        AnyView::new(vstack! {
+        page(
             header(hstack! {
                 header_title("Queue"), caption(format!("{count}")), Spacer::new(),
                 Button::icon_only(Icon::List).header_style().on_click(move || close.shell.queue_visible.set(false)).frame(28.,28.),
             }.spacing(12.), size.width),
-            ListView::new(self.app.playback.queue.tracks.clone(),current,48.,move |index,track,playing| {
-                let play=app.clone(); let width=size.width-24.;
+            AnyView::new(ListView::new(self.app.playback.queue.tracks.clone(),current,48.,move |index,track,playing| {
+                let play=app.clone(); let width=content_width(size.width)-24.;
                 hstack! {
                     queue_marker(index, playing==Some(index), 24., 40.),
                     vstack! {
@@ -251,11 +270,11 @@ impl QueueSidebar {
                         caption(truncate(track.artist.as_deref().unwrap_or("Unknown artist"),((width-80.)/6.)as usize)).font_size(11.),
                     }.spacing(3.).alignment(Alignment::Leading).frame_width(width-80.),
                     caption(track.duration.map(clock).unwrap_or_else(||"—:——".into())).font_size(10.).alignment(Alignment::Trailing).frame(40.,40.),
-                }.spacing(4.).padding_insets(EdgeInsets::new(6.,2.,6.,2.)).frame(size.width-12.,48.)
+                }.spacing(4.).padding_insets(EdgeInsets::new(6.,2.,6.,2.)).frame(content_width(size.width)-12.,48.)
                     .background(if playing==Some(index) {selected_color()}else{ColorPalette::default().background()})
                     .on_click(move || play.send(Command::Select(index)))
-            }).frame(size.width,size.height-LIBRARY_HEADER_HEIGHT),
-        }.spacing(0.).frame(size.width,size.height).background(ColorPalette::default().background()))
+            }).frame(f32::INFINITY,f32::INFINITY)),
+            size.height, true)
     }
 }
 impl View for QueueSidebar {
@@ -384,7 +403,7 @@ impl View for StatusFrame {
                 Box::new(HeaderBar::new(hstack! {
             Text::new(truncate(&message, ((v.width - 240.) / 6.) as usize)).font_size(11.).color(ColorPalette::default().text_secondary()),
             Spacer::new(), caption("Space: play / pause   ·   ← →: seek").font_size(10.),
-        }.padding_insets(EdgeInsets::new(12.,0.,12.,0.))).height(22.))
+        }.padding_insets(EdgeInsets::new(12.,0.,12.,0.))).chrome_style(ChromeStyle::Simple).height(22.))
             },
         ))
     }

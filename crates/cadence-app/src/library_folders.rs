@@ -185,7 +185,7 @@ fn set_changed(state: &State<String>, value: String) {
 /// Inline activity belongs to the source being refreshed, never a separate page.
 pub fn source_activity(workspace: &Workspace, width: f32, height: f32) -> AnyView {
     if height == 0. {
-        return AnyView::new(Spacer::new().frame(width, 0.));
+        return AnyView::new(Spacer::new().frame(crate::ui::content_width(width), 0.));
     }
     AnyView::new(SourceActivity {
         folders: workspace.folders.clone(),
@@ -220,7 +220,7 @@ impl SourceActivity {
         };
         let errors = folders.errors.get();
         let expanded = folders.details_expanded.get();
-        let content_width = self.width - 64.;
+        let content_width = crate::ui::content_width(self.width) - 24.;
         let error_rows = if expanded {
             AnyView::new(vstack! {
                 caption(truncate(&folders.failure.get(), (content_width / 6.5) as usize)).alignment(Alignment::Leading).frame(content_width, if folders.failure.get().is_empty() {0.} else {24.}),
@@ -244,8 +244,8 @@ impl SourceActivity {
                 details,
             }.spacing(12.).frame(content_width,48.),
             error_rows,
-        }.spacing(0.).frame(content_width,self.height - 16.).padding_insets(EdgeInsets::new(12.,4.,12.,4.))).frame(self.width - 40., self.height - 8.)
-            .padding_insets(EdgeInsets::new(20.,4.,20.,4.)).frame(self.width,self.height))
+        }.spacing(0.).frame(content_width,self.height - 16.).padding_insets(EdgeInsets::new(12.,4.,12.,4.))).frame(crate::ui::content_width(self.width), self.height - 8.)
+            .padding_insets(EdgeInsets::new(0.,4.,0.,4.)).frame(crate::ui::content_width(self.width),self.height))
     }
 }
 impl View for SourceActivity {

@@ -1417,7 +1417,9 @@ impl LibraryPane {
     fn body(&self) -> AnyView {
         let workspace = &self.app.workspace;
         let width = self.width;
-        let list_height = (self.height - LIBRARY_HEADER_HEIGHT - 28.).max(80.);
+        let list_height =
+            (self.height - LIBRARY_HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - PLAYER_CLEARANCE)
+                .max(80.);
         let select = workspace.clone();
         let play_app = self.app.clone();
         let columns = library_columns(width - 44.);
@@ -1461,27 +1463,22 @@ impl LibraryPane {
                         select.queue_collection(&play_app, &select.filtered.get(), Some(index));
                     }),
                     Button::icon_only(Icon::Plus).header_style().on_click(move || add.workspace.queue_track(&add, added.clone(), false)).frame(28.,28.),
-                    }.spacing(12.).padding_insets(EdgeInsets::horizontal(20.)).frame(width,40.)
+                    }.spacing(12.).padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(content_width(width),40.)
                      .background(catalog_row_color(selected == Some(index), index))
                 },
-            ).item_key(|track| track.id.clone().into()).content_bottom_inset(PLAYER_CLEARANCE).frame(width, list_height))
+            ).item_key(|track| track.id.clone().into()).frame(f32::INFINITY, f32::INFINITY))
         };
-        AnyView::new(
-            Surface::new(
-                vstack! {
-                    library_header(&self.app, "All songs", format!("{} songs", workspace.filtered.get().len()), workspace.query.clone(), "Search title, artist, or album", width),
-                    HeaderBar::new(hstack! {
-                        catalog_heading("Title", columns[0], false),
-                        catalog_heading("Artist", columns[1], false),
-                        catalog_heading("Album", columns[2], false),
-                        catalog_heading("Time", columns[3], true),
-                    }.spacing(12.).padding_insets(EdgeInsets::horizontal(20.))).height(28.),
-                    content,
-                }
-                .spacing(0.),
-                SurfaceRole::Canvas,
-            )
-            .frame(width, self.height),
+        page_with_header_height(
+            AnyView::new(vstack! {
+                library_header(&self.app, "All songs", format!("{} songs", workspace.filtered.get().len()), workspace.query.clone(), "Search title, artist, or album", width),
+                column_header(hstack! {
+                    catalog_heading("Title", columns[0], false),
+                    catalog_heading("Artist", columns[1], false),
+                    catalog_heading("Album", columns[2], false),
+                    catalog_heading("Time", columns[3], true),
+                }.spacing(12.), width),
+            }.spacing(0.)),
+            content, self.height, LIBRARY_HEADER_HEIGHT + COLUMN_HEADER_HEIGHT, !workspace.filtered.get().is_empty(),
         )
     }
 }
@@ -1552,7 +1549,7 @@ impl SourcesPane {
                 Icon::FolderPlus,
                 "Bring your music together",
                 "Add a source to browse music from a folder, server, or plugin.",
-                self.height - LIBRARY_HEADER_HEIGHT,
+                self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE,
             )
         } else {
             AnyView::new(ListView::new(state(rows), state(None), 76., move |_, row, _| {
@@ -1564,16 +1561,30 @@ impl SourcesPane {
                         caption(truncate(&row.detail, ((width - 148.) / 6.5) as usize)),
                     }.spacing(3.).alignment(Alignment::Leading).frame_width(width - 148.),
                     IconView::new(Icon::ChevronRight).size(IconSize::Small).alignment(Alignment::Center).frame(20.,48.),
-                }.spacing(12.).padding_insets(EdgeInsets::horizontal(16.)).frame(width - 40.,64.))
-                    .frame(width - 40.,64.).padding_insets(EdgeInsets::new(20.,6.,20.,6.))
+                }.spacing(12.).padding_insets(EdgeInsets::horizontal(16.)).frame(content_width(width),64.))
+                    .frame(content_width(width),64.).padding_insets(EdgeInsets::new(0.,6.,0.,6.))
                     .on_click(move || app.workspace.open_provider(&app, row.id.clone()))
-            }).item_key(|row| format!("{:?}", row.id).into()).content_bottom_inset(PLAYER_CLEARANCE).frame(width, self.height - LIBRARY_HEADER_HEIGHT))
+            }).item_key(|row| format!("{:?}", row.id).into()).frame(f32::INFINITY, f32::INFINITY))
         };
-        AnyView::new(Surface::new(vstack! {
-            self.heading("Sources", counted(count,"source"), AnyView::new(
-                button("Add source").icon(Icon::Plus).header_style().on_click(move || { connect.source_status.set(String::new()); connect.source_page.set(SourcePage::Connect); }).frame(110.,32.))),
+        page(
+            self.heading(
+                "Sources",
+                counted(count, "source"),
+                AnyView::new(
+                    button("Add source")
+                        .icon(Icon::Plus)
+                        .header_style()
+                        .on_click(move || {
+                            connect.source_status.set(String::new());
+                            connect.source_page.set(SourcePage::Connect);
+                        })
+                        .frame(110., 32.),
+                ),
+            ),
             content,
-        }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
+            self.height,
+            count > 0,
+        )
     }
     fn connect(&self) -> AnyView {
         let workspace = &self.app.workspace;
@@ -1607,16 +1618,16 @@ impl SourcesPane {
                     .alignment(Alignment::Leading).frame(form_width,40.),
             }.spacing(10.))
         };
-        AnyView::new(Surface::new(vstack! {
+        page(
             back_header("Add source",AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || back.source_page.set(SourcePage::Overview)),
-            vstack! {
+            AnyView::new(vstack! {
                 caption("Source type").alignment(Alignment::Leading).frame(form_width,20.),
                 Select::new(vec!["Local folder".into(), "Kanade".into(), "DLNA".into(), "Source plugin".into()], workspace.source_kind.clone()).width(form_width).row_height(32.),
                 setup,
                 Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
                     .alignment(Alignment::Leading).frame(form_width,36.),
-            }.spacing(10.).padding(20.).alignment(Alignment::TopLeading).frame(width,self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE),
-        }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
+            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE)),
+            self.height, false)
     }
     fn certificate(&self) -> AnyView {
         let workspace = &self.app.workspace;
@@ -1643,12 +1654,12 @@ impl SourcesPane {
                 },
             }.spacing(8.))
         };
-        AnyView::new(Surface::new(vstack! {
+        page(
             back_header("Client certificate",AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || {
                 back.certificate_secret.clear();
                 back.source_page.set(SourcePage::Browse);
             }),
-            vstack! {
+            AnyView::new(vstack! {
                 caption("Choose your PKCS#12 (.p12 or .pfx) certificate.").alignment(Alignment::Leading).frame(form_width,24.),
                 hstack! {
                     TextField::new(workspace.certificate_path.clone()).placeholder("Certificate file path").font_size(13.).padding(8.).on_key(|_| true).frame(form_width-132.,36.),
@@ -1668,8 +1679,8 @@ impl SourcesPane {
                     caption(status_lines[1].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
                     caption(status_lines[2].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
                 }.spacing(0.).frame(form_width,60.),
-            }.spacing(10.).padding(20.).alignment(Alignment::TopLeading).frame(width,self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE),
-        }.spacing(0.), SurfaceRole::Canvas).frame(width,self.height))
+            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE)),
+            self.height, false)
     }
     fn browse(&self) -> AnyView {
         let workspace = &self.app.workspace;
@@ -1833,8 +1844,8 @@ impl SourcesPane {
                     .on_click(move || reconnect.workspace.toggle_kanade_identity(&reconnect))
                     .frame(240., 28.)
                     .alignment(Alignment::Leading)
-                    .padding_insets(EdgeInsets::horizontal(20.))
-                    .frame(width, 36.),
+                    .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))
+                    .frame(content_width(width), 36.),
                 )
             } else {
                 AnyView::new(
@@ -1844,8 +1855,8 @@ impl SourcesPane {
                         "Client certificate: Off"
                     })
                     .alignment(Alignment::Leading)
-                    .padding_insets(EdgeInsets::horizontal(20.))
-                    .frame(width, 36.),
+                    .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))
+                    .frame(content_width(width), 36.),
                 )
             }
         } else {
@@ -1856,8 +1867,8 @@ impl SourcesPane {
                 AnyView::new(
                     caption("Certificate authorization pending…")
                         .alignment(Alignment::Leading)
-                        .padding_insets(EdgeInsets::horizontal(20.))
-                        .frame(width, 36.),
+                        .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))
+                        .frame(content_width(width), 36.),
                 )
             } else if workspace.config_writable && !workspace.read_only.get() {
                 let authorize = workspace.clone();
@@ -1867,16 +1878,20 @@ impl SourcesPane {
                         .on_click(move || authorize.open_certificate_setup())
                         .frame(240., 28.)
                         .alignment(Alignment::Leading)
-                        .padding_insets(EdgeInsets::horizontal(20.))
-                        .frame(width, 36.),
+                        .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))
+                        .frame(content_width(width), 36.),
                 )
             } else {
-                AnyView::new(Spacer::new().frame(width, 36.))
+                AnyView::new(Spacer::new().frame(content_width(width), 36.))
             }
         } else {
             AnyView::new(Spacer::new().frame(0., 0.))
         };
-        let content_height = self.height - LIBRARY_HEADER_HEIGHT - status_height - activity_height;
+        let content_height = self.height
+            - LIBRARY_HEADER_HEIGHT
+            - status_height
+            - activity_height
+            - PLAYER_CLEARANCE;
         let entries = if workspace.source_entries.get().is_empty() {
             catalog_empty(
                 Icon::Music,
@@ -1912,20 +1927,21 @@ impl SourcesPane {
                         }
                     }),
                     IconView::new(if icon == Icon::Folder { Icon::ChevronRight } else { Icon::PlayerPlay }).size(IconSize::Small).alignment(Alignment::Center).frame(28.,28.),
-                }.spacing(12.).padding_insets(EdgeInsets::horizontal(20.)).frame(width,52.)
+                }.spacing(12.).padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(content_width(width),52.)
                     .background(catalog_row_color(selection == Some(index), index))
-            }).content_bottom_inset(PLAYER_CLEARANCE).frame(width,content_height))
+            }).frame(content_width(width),content_height))
         };
-        AnyView::new(Surface::new(vstack! {
+        page(
             back_header(&title,AnyView::new(hstack! { refresh, remove_action }.spacing(8.)),220.,width,move || back.workspace.back_in_source(&back)),
+            AnyView::new(vstack! {
             caption(truncate(&workspace.source_status.get(), ((width - 40.) / 6.5).max(1.) as usize)).font_size(11.).alignment(Alignment::Leading)
-                .padding_insets(EdgeInsets::horizontal(20.)).frame(width,28.).clip(),
-            if kanade { AnyView::new(caption(truncate(&sync_status, ((width - 40.) / 6.5).max(1.) as usize)).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(20.)).frame(width,24.).clip()) } else { AnyView::new(Spacer::new().frame(0.,0.)) },
+                .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(content_width(width),28.).clip(),
+            if kanade { AnyView::new(caption(truncate(&sync_status, ((width - 40.) / 6.5).max(1.) as usize)).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(content_width(width),24.).clip()) } else { AnyView::new(Spacer::new().frame(0.,0.)) },
             identity_control,
             authorization_control,
             activity,
             entries,
-        }.spacing(0.),SurfaceRole::Canvas).frame(width,self.height))
+            }.spacing(0.)), self.height, false)
     }
 }
 

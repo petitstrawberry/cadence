@@ -72,7 +72,7 @@ pub(super) fn view(app: &Cadence, width: f32) -> AnyView {
     .frame(32., 32.);
 
     AnyView::new(
-        Surface::floating(
+        chrome_surface(
             hstack! {
                 TrackInfoFrame { app: app.clone(), width: side_width }.repaint_boundary(),
                 vstack! {
@@ -112,7 +112,8 @@ pub(super) fn view(app: &Cadence, width: f32) -> AnyView {
             .frame(width - 24., 56.)
             .padding_insets(EdgeInsets::new(12., 4., 12., 4.)),
         )
-        .frame(width, 64.),
+        .clip_content(true)
+        .frame(width, PLAYER_HEIGHT),
     )
 }
 
@@ -208,7 +209,7 @@ fn compact_view(app: &Cadence, width: f32) -> AnyView {
         Button::icon_only(Icon::ChevronRight).header_style().icon_size(IconSize::Small).on_click(move || next.send(Command::Next)).frame(28.,28.),
         repeat_button,
     }.spacing(4.).frame(if show_repeat {168.} else {104.},28.);
-    AnyView::new(Surface::floating(hstack! {
+    AnyView::new(chrome_surface(hstack! {
         TrackInfoFrame { app: app.clone(), width: info_width }.repaint_boundary(),
         vstack! {
             controls.alignment(Alignment::Center).frame(control_width,32.),
@@ -220,7 +221,7 @@ fn compact_view(app: &Cadence, width: f32) -> AnyView {
         }.spacing(2.).frame(control_width,54.),
         hstack! { QueueButton { app: app.clone() }, volume_control }
             .spacing(6.).alignment(Alignment::Trailing).frame(info_width,32.),
-    }.spacing(12.).frame(width - 24.,56.).padding_insets(EdgeInsets::new(12.,4.,12.,4.))).frame(width,64.))
+    }.spacing(12.).frame(width - 24.,56.).padding_insets(EdgeInsets::new(12.,4.,12.,4.))).clip_content(true).frame(width,PLAYER_HEIGHT))
 }
 
 fn fit_track_label(value: &str, font_size: f32, width: f32) -> String {

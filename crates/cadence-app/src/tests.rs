@@ -1255,7 +1255,10 @@ fn render_offscreen_ui_for_visual_review() {
     for (name, size) in [
         ("minimum", Size::new(900., 568.)),
         ("default", Size::new(1280., 768.)),
-    ] {
+    ]
+    .into_iter()
+    .chain(std::env::var_os("CADENCE_RENDER_TALL").map(|_| ("tall", Size::new(1600., 1400.))))
+    {
         for mode in modes().chain([
             "source-overview",
             "source-connect",
@@ -1265,7 +1268,11 @@ fn render_offscreen_ui_for_visual_review() {
             "artist-albums",
             "album-detail",
             "library-long",
+            "library-scrolled",
         ]) {
+            if name == "tall" && mode != "queue" {
+                continue;
+            }
             let mut app = app();
             app.size.set(size);
             match mode {
@@ -1323,13 +1330,24 @@ fn render_offscreen_ui_for_visual_review() {
                 }
                 "artist-albums" => prepare_mode(&app, "artists"),
                 "album-detail" => prepare_mode(&app, "albums"),
-                "library-long" => {
+                "library-long" | "library-scrolled" => {
                     app.workspace.library.set(scroll_catalog(120));
                     app.workspace.query.set(" ".into());
                     app.workspace.poll(&app);
                     app.workspace.tab.set(Tab::Library);
                 }
                 _ => prepare_mode(&app, mode),
+            }
+            if name == "tall" {
+                app.playback.queue.tracks.set(
+                    (0..100)
+                        .map(|i| {
+                            let mut track = tracks()[0].clone();
+                            track.title = format!("Queue track {i}");
+                            track
+                        })
+                        .collect(),
+                );
             }
             let mut pipeline = scarlet_ui::RenderingPipeline::new();
             pipeline.set_root(content_window(&app, size).create_element());
@@ -1345,6 +1363,17 @@ fn render_offscreen_ui_for_visual_review() {
             }
             if mode == "album-detail" {
                 click(pipeline.element_tree_mut(), "Small moments");
+            }
+            if mode == "library-scrolled" {
+                pipeline.handle_event(&Event::Mouse(MouseEvent::Moved { x: 400, y: 200 }));
+                pipeline.handle_event(&Event::Mouse(MouseEvent::Wheel {
+                    delta_x: 0,
+                    delta_y: -180,
+                    x: 400,
+                    y: 200,
+                    phase: scarlet_ui::event::WheelPhase::Moved,
+                    source: scarlet_ui::event::ScrollSource::Trackpad,
+                }));
             }
             for _ in 0..4 {
                 if let Some(buffer) = pipeline.render() {
@@ -1463,21 +1492,127 @@ fn settle_render(pipeline: &mut scarlet_ui::RenderingPipeline) -> Option<Vec<u8>
     panic!("Retained UI did not settle after twelve frames");
 }
 
+enum RetainedPaint {
+    Raster(Arc<scarlet_ui::buffer::Buffer>),
+    Commands(Arc<scarlet_ui::renderer::DisplayList>),
+}
+
+impl RetainedPaint {
+    fn same_resource(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Raster(left), Self::Raster(right)) => Arc::ptr_eq(left, right),
+            (Self::Commands(left), Self::Commands(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Default)]
-struct RasterFrame {
-    chunks: Vec<(Rect, std::sync::Arc<scarlet_ui::buffer::Buffer>)>,
+struct PaintFrame {
+    records: Vec<(Rect, RetainedPaint)>,
+}
+
+fn capture_retained_paint(
+    context: &PaintContext<'_>,
+    origin: Point,
+    clips: &mut Vec<Rect>,
+    scale_milli: u32,
+    frame: &mut PaintFrame,
+) {
+    use scarlet_ui::renderer::{PaintBuffer, PaintRegion};
+
+    let clipped = |rect: Rect, clips: &[Rect]| {
+        let mut rect = Rect::new(
+            Point::new(rect.left() + origin.x, rect.top() + origin.y),
+            rect.size,
+        );
+        for clip in clips {
+            let left = rect.left().max(clip.left());
+            let top = rect.top().max(clip.top());
+            let right = rect.right().min(clip.right());
+            let bottom = rect.bottom().min(clip.bottom());
+            if right <= left || bottom <= top {
+                return None;
+            }
+            rect = Rect::from_xywh(left, top, right - left, bottom - top);
+        }
+        Some(rect)
+    };
+
+    for command in context.commands() {
+        match command {
+            PaintCommand::DrawDisplayList {
+                origin: local,
+                list,
+            } => {
+                let origin = Point::new(origin.x + local.x, origin.y + local.y);
+                if !list
+                    .context()
+                    .commands()
+                    .iter()
+                    .any(|command| matches!(command, PaintCommand::DrawDisplayList { .. }))
+                {
+                    for dependency in list.context().paint_dependencies(scale_milli) {
+                        match dependency.writes {
+                            PaintRegion::Rect(rect) => {
+                                let rect = Rect::new(
+                                    Point::new(rect.left() + local.x, rect.top() + local.y),
+                                    rect.size,
+                                );
+                                if let Some(rect) = clipped(rect, clips) {
+                                    frame
+                                        .records
+                                        .push((rect, RetainedPaint::Commands(list.clone())));
+                                }
+                            }
+                            PaintRegion::Empty => {}
+                            PaintRegion::Unknown => panic!("Retained paint has unknown coverage"),
+                        }
+                    }
+                }
+                capture_retained_paint(list.context(), origin, clips, scale_milli, frame);
+            }
+            PaintCommand::DrawBuffer { dst, buffer_idx }
+            | PaintCommand::DrawBufferRect {
+                dst, buffer_idx, ..
+            } => {
+                if let PaintBuffer::Shared(buffer) = &context.buffers()[*buffer_idx]
+                    && let Some(rect) = clipped(*dst, clips)
+                {
+                    frame
+                        .records
+                        .push((rect, RetainedPaint::Raster(buffer.clone())));
+                }
+            }
+            PaintCommand::PushClip { rect, .. } => clips.push(Rect::new(
+                Point::new(rect.left() + origin.x, rect.top() + origin.y),
+                rect.size,
+            )),
+            PaintCommand::PopClip => {
+                clips.pop();
+            }
+            _ => {}
+        }
+    }
 }
 
 struct ObservedCpuBackend {
     cpu: scarlet_ui::renderer::CpuPaintBackend,
-    frames: Rc<RefCell<Vec<RasterFrame>>>,
+    frames: Rc<RefCell<Vec<PaintFrame>>>,
+    scale_milli: u32,
 }
 
 impl scarlet_ui::renderer::PaintBackend for ObservedCpuBackend {
+    fn supports_retained_display_lists(&self) -> bool {
+        // Observe the production SGFX recording path, using CPU rendering as
+        // the pixel oracle for unchanged regions and transport updates.
+        true
+    }
     fn uses_cpu_picture_cache(&self) -> bool {
         true
     }
     fn resize(&mut self, size: Size, scale_milli: u32) {
+        self.scale_milli = scale_milli;
         scarlet_ui::renderer::PaintBackend::resize(&mut self.cpu, size, scale_milli);
     }
 
@@ -1488,19 +1623,14 @@ impl scarlet_ui::renderer::PaintBackend for ObservedCpuBackend {
         logical_damage: Option<&[Rect]>,
         physical_damage: Option<&[scarlet_ui::compositor::DamageRect]>,
     ) -> scarlet_ui::error::Result<scarlet_ui::renderer::BackendFrame<'a>> {
-        let mut frame = RasterFrame::default();
-        for command in context.commands() {
-            let (dst, index) = match command {
-                PaintCommand::DrawBuffer { dst, buffer_idx }
-                | PaintCommand::DrawBufferRect {
-                    dst, buffer_idx, ..
-                } => (*dst, *buffer_idx),
-                _ => continue,
-            };
-            if let scarlet_ui::renderer::PaintBuffer::Shared(buffer) = &context.buffers()[index] {
-                frame.chunks.push((dst, buffer.clone()));
-            }
-        }
+        let mut frame = PaintFrame::default();
+        capture_retained_paint(
+            context,
+            Point::ZERO,
+            &mut Vec::new(),
+            self.scale_milli,
+            &mut frame,
+        );
         self.frames.borrow_mut().push(frame);
         scarlet_ui::renderer::PaintBackend::render(
             &mut self.cpu,
@@ -1530,20 +1660,20 @@ fn transport_boundary(element: &dyn Element, parent: Point) -> Option<Rect> {
         .find_map(|child| transport_boundary(child.as_ref(), origin))
 }
 
-fn assert_reused_raster_outside_transport(
-    previous: &RasterFrame,
-    next: &RasterFrame,
+fn assert_reused_paint_outside_transport(
+    previous: &PaintFrame,
+    next: &PaintFrame,
     transport: Rect,
 ) {
     assert!(
-        !next.chunks.is_empty(),
-        "CPU backend did not receive retained raster buffers"
+        !next.records.is_empty(),
+        "CPU backend did not receive retained paint resources"
     );
-    // ScarletUI publishes a new Arc whenever it rasterizes a retained chunk.
-    // Holding the previous Arc makes reuse measurable even when pixels match.
-    for (rect, buffer) in &next.chunks {
-        let reused = previous.chunks.iter().any(|(old_rect, old_buffer)| {
-            old_rect == rect && std::sync::Arc::ptr_eq(old_buffer, buffer)
+    // New raster or command recordings get a new Arc. Keep previous resources
+    // alive so a fresh recording cannot look reused through allocator reuse.
+    for (rect, resource) in &next.records {
+        let reused = previous.records.iter().any(|(old_rect, old_resource)| {
+            old_rect == rect && old_resource.same_resource(resource)
         });
         if !reused {
             assert!(
@@ -1553,7 +1683,7 @@ fn assert_reused_raster_outside_transport(
                         <= transport.origin.x + transport.size.width + 0.5
                     && rect.origin.y + rect.size.height
                         <= transport.origin.y + transport.size.height + 0.5,
-                "Transport update rerasterized an unrelated layer: {rect:?}; transport: {transport:?}"
+                "Transport update replaced unrelated retained paint: {rect:?}; transport: {transport:?}"
             );
         }
     }
@@ -1582,6 +1712,7 @@ fn transport_ticks_update_pixels_without_rebuilding_the_shell_or_catalog() {
                     ColorPalette::default().background(),
                 ),
                 frames: frames.clone(),
+                scale_milli: 1000,
             }));
             pipeline.set_root(content_window(&app, size).create_element());
             pipeline.layout_initial();
@@ -1589,10 +1720,10 @@ fn transport_ticks_update_pixels_without_rebuilding_the_shell_or_catalog() {
             let transport =
                 transport_boundary(pipeline.element_tree().root().unwrap(), Point::ZERO)
                     .expect("Transport must have its own repaint boundary");
-            let mut raster_before = frames
+            let mut paint_before = frames
                 .borrow_mut()
                 .pop()
-                .expect("Initial CPU raster was not observed");
+                .expect("Initial retained paint was not observed");
             frames.borrow_mut().clear();
             let before = build_counts(&app);
             assert!(
@@ -1620,15 +1751,15 @@ fn transport_ticks_update_pixels_without_rebuilding_the_shell_or_catalog() {
                 let next =
                     settle_render(&mut pipeline).expect("Changed controls did not produce pixels");
                 for frame in frames.borrow_mut().drain(..) {
-                    assert_reused_raster_outside_transport(&raster_before, &frame, transport);
-                    // A partial present may omit unchanged chunks. Keep every
+                    assert_reused_paint_outside_transport(&paint_before, &frame, transport);
+                    // A partial present may omit unchanged recordings. Keep every
                     // previously observed Arc alive so allocator reuse cannot
-                    // disguise a later rerasterization of that static layer.
-                    for chunk in frame.chunks {
-                        if !raster_before.chunks.iter().any(|(rect, buffer)| {
-                            *rect == chunk.0 && std::sync::Arc::ptr_eq(buffer, &chunk.1)
+                    // disguise a later repaint recording of that static layer.
+                    for chunk in frame.records {
+                        if !paint_before.records.iter().any(|(rect, buffer)| {
+                            *rect == chunk.0 && buffer.same_resource(&chunk.1)
                         }) {
-                            raster_before.chunks.push(chunk);
+                            paint_before.records.push(chunk);
                         }
                     }
                 }
@@ -1702,6 +1833,7 @@ fn forward_only_stream_has_readonly_progress_and_working_volume() {
             ColorPalette::default().background(),
         ),
         frames: frames.clone(),
+        scale_milli: 1000,
     }));
     pipeline.set_root(content_window(&app, size).create_element());
     pipeline.layout_initial();
@@ -1772,10 +1904,10 @@ fn forward_only_stream_has_readonly_progress_and_working_volume() {
         std::thread::sleep(Duration::from_millis(2));
     }
     let before_pixels = settle_render(&mut pipeline).expect("Volume edit did not repaint");
-    let raster_before = frames
+    let paint_before = frames
         .borrow_mut()
         .pop()
-        .expect("CPU raster was not observed");
+        .expect("CPU frame was not observed");
     frames.borrow_mut().clear();
     let before_builds = build_counts(&app);
     let transport =
@@ -1798,7 +1930,7 @@ fn forward_only_stream_has_readonly_progress_and_working_volume() {
         "Stream progress rebuilt unrelated views"
     );
     for frame in frames.borrow().iter() {
-        assert_reused_raster_outside_transport(&raster_before, frame, transport);
+        assert_reused_paint_outside_transport(&paint_before, frame, transport);
     }
     assert!(
         all_targets(pipeline.element_tree())
@@ -1922,6 +2054,7 @@ fn play_all_preserves_album_detail_and_navigation_at_native_retina_size() {
                 ColorPalette::default().background(),
             ),
             frames: frames.clone(),
+            scale_milli,
         }));
         pipeline.set_scale_milli(scale_milli);
         pipeline.set_root(app.window(window).create_element());
@@ -1963,7 +2096,9 @@ fn play_all_preserves_album_detail_and_navigation_at_native_retina_size() {
             button.size.height + 6.,
         );
         click_at(pipeline.element_tree_mut(), &mut dispatcher, point);
-        let after_click = settle_render(&mut pipeline).expect("Play all did not render");
+        // The retained renderer may skip a click frame when its final paint is
+        // unchanged; the playback worker's next update still has to repaint.
+        let after_click = settle_render(&mut pipeline).unwrap_or_else(|| before_click.clone());
         let scale = scale_milli as f32 / 1000.;
         let physical_width = (window.width * scale) as usize;
         assert_pixels_unchanged_in_rect(
@@ -1993,15 +2128,14 @@ fn play_all_preserves_album_detail_and_navigation_at_native_retina_size() {
             None,
         );
         for frame in frames.borrow().iter() {
-            for (rect, buffer) in &frame.chunks {
+            for (rect, buffer) in &frame.records {
                 if rects_overlap(*rect, static_region) {
                     assert!(
                         before_worker
-                            .chunks
+                            .records
                             .iter()
-                            .any(|(old_rect, old)| old_rect == rect
-                                && std::sync::Arc::ptr_eq(old, buffer)),
-                        "Starting album playback rerasterized static navigation/detail: {rect:?}"
+                            .any(|(old_rect, old)| old_rect == rect && old.same_resource(buffer)),
+                        "Starting album playback replaced static retained navigation/detail: {rect:?}"
                     );
                 }
             }
@@ -2026,33 +2160,49 @@ struct ListScroll {
     viewport: Size,
     content_height: f32,
     offset: f32,
+    inset_top: f32,
 }
 
 fn list_scrolls(element: &dyn Element, found: &mut Vec<ListScroll>) {
+    list_scrolls_in_scope(element, Point::ZERO, None, found);
+}
+
+fn list_scrolls_in_scope(
+    element: &dyn Element,
+    parent: Point,
+    safe_rect: Option<Rect>,
+    found: &mut Vec<ListScroll>,
+) {
+    let origin = Point::new(
+        parent.x + element.position().x,
+        parent.y + element.position().y,
+    );
+    let safe_rect = element
+        .render_object()
+        .and_then(|render| render.as_any().downcast_ref::<ContentInsetsRenderObject>())
+        .map(|scope| Rect::new(origin, element.bounds().size).inset(scope.content_insets()))
+        .or(safe_rect);
     let name = element.type_name_debug();
     if name.starts_with("RenderElement<scarlet_ui_core::views::scroll::ScrollView<")
         && (name.contains("ListContentView<") || name.contains("containers::vstack::VStack<"))
         && let Some(child) = element.children().first()
     {
+        // Observe the current scope, including floating chrome, rather than
+        // inferring reservations from the row type or duplicating its padding.
+        let inset_top = safe_rect.map_or(0., |safe| (safe.top() - origin.y).max(0.));
+        let inset_bottom = safe_rect.map_or(0., |safe| {
+            (origin.y + element.bounds().size.height - safe.bottom()).max(0.)
+        });
         found.push(ListScroll {
+            inset_top,
             id: element.id(),
             viewport: element.bounds().size,
-            content_height: child.bounds().size.height
-                + if name.contains("cadence_library::LibraryTrack")
-                    || name.contains("cadence_core::player::Track")
-                    || name.contains("extension::SourceItem")
-                    || name.contains("extension::ProviderRow")
-                    || name.contains("containers::vstack::VStack<")
-                {
-                    PLAYER_CLEARANCE
-                } else {
-                    0.
-                },
-            offset: -child.position().y,
+            content_height: child.bounds().size.height + inset_bottom,
+            offset: inset_top - child.position().y,
         });
     }
     for child in element.children() {
-        list_scrolls(child.as_ref(), found);
+        list_scrolls_in_scope(child.as_ref(), origin, safe_rect, found);
     }
 }
 
@@ -2086,7 +2236,7 @@ fn scroll_list_to_end(
         .find(|scroll| scroll.id == id)
         .expect("List scroll identity was lost");
     let expected_content = row_count as f32 * row_height + bottom_inset;
-    let expected_offset = (expected_content - scroll.viewport.height).max(0.);
+    let expected_offset = (expected_content + scroll.inset_top - scroll.viewport.height).max(0.);
     assert!(
         (scroll.content_height - expected_content).abs() < 0.5,
         "Wrong list extent: {scroll:?}; expected {expected_content}"
@@ -2122,8 +2272,8 @@ fn list_scroll_extent_clamps_after_queue_filter_folder_and_source_shrink() {
         ("sources", 52.),
     ] {
         let bottom_inset = if mode == "detail" {
-            164. + PLAYER_CLEARANCE
-        } else if ["queue", "library", "folders", "sources"].contains(&mode) {
+            136. + PLAYER_CLEARANCE
+        } else if ["queue", "library", "folders"].contains(&mode) {
             PLAYER_CLEARANCE
         } else {
             0.
@@ -2315,6 +2465,62 @@ fn native_effect_short_lists_do_not_scroll_into_empty_space() {
 }
 
 #[test]
+fn queue_sidebar_tracks_allocated_height_after_resize_and_reopen() {
+    let app = app();
+    app.playback.queue.tracks.set(
+        (0..100)
+            .map(|i| {
+                let mut track = tracks()[0].clone();
+                track.title = format!("Queue track {i}");
+                track
+            })
+            .collect(),
+    );
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(app.create_element());
+    for size in [
+        Size::new(1600., 1400.),
+        Size::new(1280., 640.),
+        Size::new(1600., 1400.),
+    ] {
+        app.size.set(size);
+        pipeline.resize(size);
+        for _ in 0..4 {
+            pipeline.render_for_present().unwrap();
+        }
+        let mut scrolls = Vec::new();
+        list_scrolls(pipeline.element_tree().root().unwrap(), &mut scrolls);
+        let queue = scrolls
+            .iter()
+            .find(|s| s.viewport.width < 400.)
+            .expect("Queue list");
+        assert_eq!(
+            queue.viewport.height,
+            size.height - 22.,
+            "Queue must fill its split pane"
+        );
+        app.shell.queue_visible.set(false);
+        pipeline.render_for_present().unwrap();
+        app.shell.queue_visible.set(true);
+        for _ in 0..4 {
+            pipeline.render_for_present().unwrap();
+        }
+        let mut reopened = Vec::new();
+        list_scrolls(pipeline.element_tree().root().unwrap(), &mut reopened);
+        assert_eq!(
+            reopened
+                .iter()
+                .find(|s| s.viewport.width < 400.)
+                .unwrap()
+                .viewport
+                .height,
+            size.height - 22.
+        );
+    }
+    pipeline.teardown();
+}
+
+#[test]
 fn gpu_scroll_command_work_is_bounded_by_visible_gallery_and_detail_rows() {
     use scarlet_ui::renderer::{BackendFrame, PaintBackend};
     struct CommandBackend(Rc<Cell<usize>>);
@@ -2471,6 +2677,89 @@ fn artists_navigate_via_albums_and_track_activation_starts_in_album_context() {
 
 #[test]
 fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
+    fn first_rect(
+        element: &dyn Element,
+        parent: Point,
+        predicate: fn(&dyn Element) -> bool,
+    ) -> Option<Rect> {
+        let origin = Point::new(
+            parent.x + element.position().x,
+            parent.y + element.position().y,
+        );
+        if predicate(element) {
+            return Some(Rect::new(origin, element.bounds().size));
+        }
+        element
+            .children()
+            .iter()
+            .find_map(|child| first_rect(child.as_ref(), origin, predicate))
+    }
+    fn assert_scroll_canvas(element: &dyn Element, sidebar_edge: f32) {
+        if element
+            .type_name_debug()
+            .starts_with("RenderElement<scarlet_ui_core::views::content_shell::ContentShell<")
+        {
+            let content = element.children()[0].as_ref();
+            let scroll = first_rect(content, Point::ZERO, |e| {
+                e.type_name_debug()
+                    .starts_with("RenderElement<scarlet_ui_core::views::scroll::ScrollView<")
+            })
+            .unwrap();
+            assert_eq!(
+                scroll.origin,
+                Point::ZERO,
+                "The scroll canvas must reach the window top and left"
+            );
+            assert_eq!(
+                scroll.size,
+                element.bounds().size,
+                "Header/player reservations must not shorten the scroll canvas"
+            );
+            let header = first_rect(element.children()[1].as_ref(), Point::ZERO, |e| {
+                e.render_object()
+                    .is_some_and(|r| r.as_any().is::<scarlet_ui::views::HeaderBarRenderObject>())
+            })
+            .unwrap();
+            // The sidebar already supplies the one 8px gap at its trailing edge.
+            assert_eq!(
+                header.left(),
+                sidebar_edge,
+                "Sidebar and header margins were added twice"
+            );
+            let scope = content
+                .render_object()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ContentInsetsRenderObject>()
+                .unwrap();
+            let safe =
+                Rect::new(content.position(), content.bounds().size).inset(scope.content_insets());
+            assert_eq!(safe.left(), header.left());
+            assert_eq!(safe.right(), header.right());
+            assert_eq!(safe.top(), element.children()[1].bounds().bottom());
+            assert_eq!(
+                safe.bottom(),
+                element.bounds().size.height - PLAYER_CLEARANCE
+            );
+            return;
+        }
+        for child in element.children() {
+            assert_scroll_canvas(child.as_ref(), sidebar_edge);
+        }
+    }
+    fn navigation(element: &dyn Element) -> Option<&dyn Element> {
+        if element.render_object().is_some_and(|render| {
+            render
+                .as_any()
+                .is::<scarlet_ui::views::navigation::NavigationViewRenderObject>()
+        }) {
+            return Some(element);
+        }
+        element
+            .children()
+            .iter()
+            .find_map(|child| navigation(child.as_ref()))
+    }
     let app = app();
     library_entries(&app);
     app.collections.poll(&app.workspace);
@@ -2484,6 +2773,28 @@ fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
         ] {
             click(&mut tree, tab);
             rebuild(&mut tree, size);
+            let nav = navigation(tree.root().unwrap()).unwrap();
+            let canvas = nav.children()[0].as_ref();
+            assert_eq!(
+                canvas.position(),
+                Point::ZERO,
+                "Canvas must reach the outer sidebar margin"
+            );
+            assert_eq!(
+                canvas.bounds().size,
+                nav.bounds().size,
+                "Canvas continues beneath the whole sidebar"
+            );
+            let safe_left = nav.children().last().unwrap().bounds().right();
+            assert_scroll_canvas(canvas, safe_left);
+            let mut content_targets = Vec::new();
+            controls(canvas, Point::ZERO, &mut content_targets, false);
+            for target in content_targets {
+                assert!(
+                    target.origin.x >= safe_left - 0.5,
+                    "Meaningful content entered the sidebar reservation: {target:?}"
+                );
+            }
             let field = all_controls(&tree)
                 .into_iter()
                 .find(|control| control.label == placeholder)
@@ -2542,7 +2853,7 @@ fn page_and_queue_headers_have_one_shared_height_and_player_has_its_own_width() 
         if element
             .render_object()
             .is_some_and(|r| r.as_any().is::<scarlet_ui::views::HeaderBarRenderObject>())
-            && origin.y.abs() < 0.5
+            && (origin.y - 8.).abs() < 0.5
         {
             found.push(Rect::new(origin, element.bounds().size));
         }
@@ -2585,7 +2896,7 @@ fn page_and_queue_headers_have_one_shared_height_and_player_has_its_own_width() 
                     })
                     .unwrap();
                 assert!(
-                    (label.origin.x - main.origin.x - PAGE_PADDING).abs() < 0.5,
+                    (label.origin.x - main.origin.x - (PAGE_PADDING - 8.)).abs() < 0.5,
                     "Header title is not aligned in {mode}: {label:?}"
                 );
                 assert!(
@@ -2607,7 +2918,7 @@ fn page_and_queue_headers_have_one_shared_height_and_player_has_its_own_width() 
                 );
             }
             let player = transport_boundary(tree.root().unwrap(), Point::ZERO).unwrap();
-            assert_eq!(player.size.width, player_width(main_width));
+            assert_eq!(player.size.width, player_width(main_width + CHROME_MARGIN));
             assert!(
                 player.size.width < main_width - 40.,
                 "Player should have more space around it than the artwork grid"
@@ -2701,7 +3012,7 @@ fn album_information_scrolls_with_virtualized_tracks_and_remains_above_player_at
         scroll.id,
         10_000,
         52.,
-        164. + PLAYER_CLEARANCE,
+        136. + PLAYER_CLEARANCE,
     );
     let targets = all_targets(pipeline.element_tree());
     let info_after = targets.iter().find(|c| c.label == "Small moments").unwrap();

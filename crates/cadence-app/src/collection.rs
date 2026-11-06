@@ -7,8 +7,8 @@ use crate::{
     extension::{Tab, Workspace},
     state,
     ui::{
-        AnyView, LIBRARY_HEADER_HEIGHT, PLAYER_CLEARANCE, back_header, button, caption, clock,
-        counted, library_header, selected_color, text, truncate,
+        AnyView, CONTENT_PADDING, back_header, button, caption, clock, content_width, counted,
+        library_header, page, scroll_content_padding, selected_color, text, truncate,
     },
 };
 use cadence_library::{ArtworkRef, LibraryTrack, MediaLocation};
@@ -449,10 +449,22 @@ impl CollectionPane {
             if let Some(artist) = self.collections.selected_artist.get() {
                 let back = self.collections.clone();
                 let groups = self.collections.artist_albums.clone();
-                return AnyView::new(Surface::new(vstack! {
-                    back_header(&artist.title, AnyView::new(caption(counted(groups.get().len(),"album")).alignment(Alignment::Trailing).frame(76.,32.)),76.,self.width,move || back.return_to_root()),
-                    self.album_grid(groups, self.height - LIBRARY_HEADER_HEIGHT),
-                }.spacing(0.), SurfaceRole::Canvas).frame(self.width, self.height));
+                return page(
+                    back_header(
+                        &artist.title,
+                        AnyView::new(
+                            caption(counted(groups.get().len(), "album"))
+                                .alignment(Alignment::Trailing)
+                                .frame(76., 32.),
+                        ),
+                        76.,
+                        self.width,
+                        move || back.return_to_root(),
+                    ),
+                    self.album_grid(groups),
+                    self.height,
+                    true,
+                );
             }
         }
         let groups = self.collections.results(self.kind).clone();
@@ -462,7 +474,7 @@ impl CollectionPane {
         } else {
             "artists"
         };
-        let content_height = (self.height - LIBRARY_HEADER_HEIGHT).max(120.);
+        let groups_empty = groups.get().is_empty();
         let content = if groups.get().is_empty() {
             let empty_library = self.collections.albums.get().is_empty();
             let title = if empty_library {
@@ -483,51 +495,71 @@ impl CollectionPane {
                 caption(detail),
                 button("Add source").icon(Icon::Plus).on_click(move || { open.workspace.source_page.set(crate::extension::SourcePage::Connect); open.workspace.tab.set(Tab::Sources); }).frame(142., 32.),
                 Spacer::new(),
-            }.spacing(12.).frame(self.width, content_height))
+            }.spacing(12.).frame(content_width(self.width), f32::INFINITY))
         } else if self.kind == CollectionKind::Artists {
-            self.artist_list(groups, content_height)
+            self.artist_list(groups)
         } else {
-            self.album_grid(groups, content_height)
+            self.album_grid(groups)
         };
-        AnyView::new(Surface::new(vstack! {
-            library_header(&self.app, if self.kind == CollectionKind::Albums { "Albums" } else { "Artists" },
-                crate::ui::counted(count, if self.kind == CollectionKind::Albums { "album" } else { "artist" }), self.collections.query(self.kind).clone(), &format!("Search {label}"), self.width),
+        page(
+            library_header(
+                &self.app,
+                if self.kind == CollectionKind::Albums {
+                    "Albums"
+                } else {
+                    "Artists"
+                },
+                crate::ui::counted(
+                    count,
+                    if self.kind == CollectionKind::Albums {
+                        "album"
+                    } else {
+                        "artist"
+                    },
+                ),
+                self.collections.query(self.kind).clone(),
+                &format!("Search {label}"),
+                self.width,
+            ),
             content,
-        }.spacing(0.), SurfaceRole::Canvas).frame(self.width, self.height))
+            self.height,
+            !groups_empty,
+        )
     }
 
-    fn album_grid(&self, groups: State<Vec<Group>>, height: f32) -> AnyView {
-        let available = (self.width - 40.).max(160.);
+    fn album_grid(&self, groups: State<Vec<Group>>) -> AnyView {
+        let available = (content_width(self.width) - CONTENT_PADDING * 2.).max(160.);
         let columns = ((available + 16.) / 176.).floor().max(1.) as usize;
         let side = (available - 16. * columns.saturating_sub(1) as f32) / columns as f32;
         let app = self.app.clone();
         let collections = self.collections.clone();
-        AnyView::new(
-            GridView::new(
-                groups,
-                self.collections.gallery_selection.clone(),
-                columns,
-                side + 50.,
-                move |_, group, _| AlbumTile {
-                    app: app.clone(),
-                    collections: collections.clone(),
-                    group,
-                    side,
-                },
-            )
-            .item_key(|group| group.key.clone().into())
-            .minimum_cell_width(160.)
-            .spacing(16.)
-            .row_spacing(16.)
-            .content_bottom_inset(PLAYER_CLEARANCE)
-            .padding_insets(EdgeInsets::new(20., 16., 20., 0.))
-            .frame(self.width, height),
+        scroll_content_padding(
+            AnyView::new(
+                GridView::new(
+                    groups,
+                    self.collections.gallery_selection.clone(),
+                    columns,
+                    side + 50.,
+                    move |_, group, _| AlbumTile {
+                        app: app.clone(),
+                        collections: collections.clone(),
+                        group,
+                        side,
+                    },
+                )
+                .item_key(|group| group.key.clone().into())
+                .minimum_cell_width(160.)
+                .spacing(16.)
+                .row_spacing(16.)
+                .frame(f32::INFINITY, f32::INFINITY),
+            ),
+            EdgeInsets::new(CONTENT_PADDING, 16., CONTENT_PADDING, 0.),
         )
     }
 
-    fn artist_list(&self, groups: State<Vec<Group>>, height: f32) -> AnyView {
+    fn artist_list(&self, groups: State<Vec<Group>>) -> AnyView {
         let collections = self.collections.clone();
-        let width = self.width - 40.;
+        let width = content_width(self.width);
         AnyView::new(ListView::new(groups, self.collections.gallery_selection.clone(), 56.,
             move |_, group, _| {
                 let collections = collections.clone();
@@ -541,7 +573,7 @@ impl CollectionPane {
                     .frame(width, 44.)
                     ).frame(width,44.).padding_insets(EdgeInsets::new(0.,6.,0.,6.))
                     .on_click(move || collections.open_group(group.clone()))
-            }).item_key(|group| group.key.clone().into()).content_bottom_inset(PLAYER_CLEARANCE).padding_insets(EdgeInsets::new(20.,16.,20.,0.)).frame(self.width, height))
+            }).item_key(|group| group.key.clone().into()).frame(f32::INFINITY, f32::INFINITY))
     }
 
     fn detail_view(&self, group: Group) -> AnyView {
@@ -569,10 +601,9 @@ impl CollectionPane {
             .view(group.artwork.clone(), 112., Icon::Music);
         let selected = self.collections.detail_selection.clone();
         let width = self.width;
-        let list_height = (self.height - LIBRARY_HEADER_HEIGHT).max(80.);
         let row_tracks = group.tracks.clone();
         let key_tracks = row_tracks.clone();
-        let content_height = 164. + group.tracks.len() as f32 * 52.;
+        let content_height = 136. + group.tracks.len() as f32 * 52.;
         let play_app = self.app.clone();
         let queue_tracks = group.tracks.clone();
         let parent = self
@@ -588,9 +619,9 @@ impl CollectionPane {
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             > 1;
-        AnyView::new(Surface::new(vstack! {
+        page(
             back_header(&parent,AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || back.detail.set(None)),
-            ScrollView::new(vstack! {
+            AnyView::new(ScrollView::new(vstack! {
             hstack! {
                 cover,
                 vstack! {
@@ -600,7 +631,7 @@ impl CollectionPane {
                     caption(format!("{} songs · {duration}", group.tracks.len())).alignment(Alignment::Leading).frame_height(20.),
                     bulk_actions.alignment(Alignment::Leading).frame_height(30.),
                 }.spacing(3.).frame(f32::INFINITY, 112.),
-            }.spacing(20.).padding_insets(EdgeInsets::new(20.,20.,20.,32.)).frame(width, 164.),
+            }.spacing(20.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,16.)).frame(content_width(width), 136.),
             LazyVStack::new(group.tracks.len(), 52., move |index| {
                     let track = row_tracks[index].clone();
                     let selection = selected.get();
@@ -625,11 +656,11 @@ impl CollectionPane {
                             play.workspace.queue_collection(&play, &tracks, Some(index));
                         }),
                         Button::icon_only(Icon::Plus).header_style().on_click(move || add.workspace.queue_track(&add, added.clone(), false)).frame(28.,28.),
-                    }.spacing(12.).padding_insets(EdgeInsets::horizontal(20.)).frame(width, 52.)
+                    }.spacing(12.).padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(content_width(width), 52.)
                         .background(if selection == Some(index) { selected_color() } else { ColorPalette::default().background() })
-                }).item_key(move |index| key_tracks[index].id.clone().into()).frame(width, content_height - 164.),
-            }.spacing(0.).frame(width, content_height)).vertical().content_bottom_inset(PLAYER_CLEARANCE).frame(width, list_height),
-        }.spacing(0.), SurfaceRole::Canvas).frame(width, self.height))
+                }).item_key(move |index| key_tracks[index].id.clone().into()).frame(content_width(width), content_height - 136.),
+            }.spacing(0.).frame(content_width(width), content_height)).vertical().frame(f32::INFINITY, f32::INFINITY)),
+            self.height, true)
     }
 }
 impl View for CollectionPane {

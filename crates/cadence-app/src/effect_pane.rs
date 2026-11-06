@@ -315,7 +315,7 @@ impl EffectPane {
         let discover = self.clone();
         let scan = self.clone();
         let submit = self.clone();
-        let body_height = (height - 80.).max(120.);
+        let body_height = (height - LIBRARY_HEADER_HEIGHT - 32.).max(120.);
         let initial_left = ((width - 1.) * 0.4).clamp(280., (width - 301.).max(280.));
         let chain_size = self.chain_size.get();
         let parameter_size = self.parameter_size.get();
@@ -374,7 +374,7 @@ impl EffectPane {
             HeaderBar::new(hstack! {
                 Text::from_state(self.status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()),
                 Spacer::new(),
-            }.padding_insets(EdgeInsets::horizontal(PAGE_PADDING))).height(32.),
+            }.padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))).chrome_style(ChromeStyle::Simple).height(32.),
         }.spacing(0.), SurfaceRole::Canvas).frame(width,height).repaint_boundary())
     }
     fn chain_view(&self, width: f32, height: f32) -> AnyView {
@@ -392,7 +392,7 @@ impl EffectPane {
         } else {
             (snapshot.discovered.len() as f32 * 36.).clamp(36., 108.)
         };
-        let chain_height = (height - available_height - 96.).max(40.);
+        let chain_height = (height - available_height - LIBRARY_HEADER_HEIGHT * 2.).max(40.);
         let chain = if snapshot.effects.is_empty() {
             AnyView::new(
                 vstack! {
@@ -401,7 +401,7 @@ impl EffectPane {
                 }
                 .spacing(6.)
                 .alignment(Alignment::TopLeading)
-                .padding(PAGE_PADDING)
+                .padding(CONTENT_PADDING)
                 .frame(width, chain_height),
             )
         } else {
@@ -424,7 +424,7 @@ impl EffectPane {
             AnyView::new(
                 caption("No plug-ins discovered")
                     .font_size(11.)
-                    .padding(PAGE_PADDING)
+                    .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))
                     .frame(width, available_height),
             )
         } else {
@@ -434,7 +434,7 @@ impl EffectPane {
                 hstack! {
                     Text::new(truncate(&plugin.name,((width - 40.) / 7.).max(8.) as usize)).font_size(12.),
                     Spacer::new(),
-                }.padding_insets(EdgeInsets::horizontal(PAGE_PADDING)).frame(width,36.)
+                }.padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(width,36.)
                     .background(if selected == Some(index) { selected_color() } else { palette.background() })
                     .on_click(move || select.discovered_selection.set(Some(index)))
             }).frame(width,available_height))
@@ -491,7 +491,7 @@ impl EffectPane {
                 Text::new(if selected.is_some() { "No adjustable parameters" } else { "Select an effect" }).font_size(14.),
                 caption(if selected.is_some() { "This plug-in has no generic controls." } else { "Choose an effect from the chain." }).font_size(11.),
                 Spacer::new(),
-            }.spacing(10.).frame(width,(height - 48.).max(40.)))
+            }.spacing(10.).frame(width,(height - LIBRARY_HEADER_HEIGHT).max(40.)))
         } else {
             AnyView::new(ListView::new(self.parameters.clone(),self.parameter_selection.clone(),68.,move |_,row,_| {
                 let parameter = row.parameter.clone();
@@ -515,8 +515,8 @@ impl EffectPane {
                     control,
                 }.spacing(4.).frame_width(width - 40.))
                     .alignment(Alignment::Leading).frame(width - 40.,68.)
-                    .padding_insets(EdgeInsets::horizontal(PAGE_PADDING)).frame(width,68.)
-            }).frame(width,(height - 48.).max(40.)))
+                    .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(width,68.)
+            }).frame(width,(height - LIBRARY_HEADER_HEIGHT).max(40.)))
         };
         AnyView::new(
             Surface::new(
