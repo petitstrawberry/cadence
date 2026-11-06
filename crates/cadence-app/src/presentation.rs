@@ -112,12 +112,13 @@ struct MainColumn {
     app: Cadence,
 }
 impl MainColumn {
-    fn page(&self, tab: Tab) -> AnyView {
+    fn page(&self, tab: Tab, region: PageRegion) -> AnyView {
         let size = self.app.shell.primary_size.get();
         let width = (size.width - SIDEBAR_WIDTH).max(500.) + CHROME_MARGIN;
         let height = size.height;
         let content = if self.app.browser.visible.get() {
             AnyView::new(BrowserFrame {
+                region,
                 app: self.app.clone(),
                 width,
                 height,
@@ -129,42 +130,48 @@ impl MainColumn {
                     collection::CollectionKind::Albums,
                     width,
                     height,
+                    region,
                 ),
                 Tab::Artists => self.app.collections.view(
                     &self.app,
                     collection::CollectionKind::Artists,
                     width,
                     height,
+                    region,
                 ),
                 Tab::Playing => AnyView::new(QueueFrame {
+                    region,
                     app: self.app.clone(),
                     width,
                     height,
                 }),
-                Tab::Library => self.app.workspace.library_view(&self.app, width, height),
-                Tab::Sources => self.app.workspace.sources_view(&self.app, width, height),
+                Tab::Library => self
+                    .app
+                    .workspace
+                    .library_view(&self.app, width, height, region),
+                Tab::Sources => self
+                    .app
+                    .workspace
+                    .sources_view(&self.app, width, height, region),
                 Tab::Effects => {
                     if let Some(effects) = &self.app.effects {
                         let app = self.app.clone();
-                        AnyView::new(
-                            effects
-                                .view(
-                                    width,
-                                    height - PLAYER_CLEARANCE,
-                                    Rc::new(move || app.open_effect()),
-                                )
-                                .safe_area_padding(SafeAreaEdges::ALL),
-                        )
+                        effects.view(width, height, Rc::new(move || app.open_effect()), region)
                     } else {
-                        AnyView::new(
-                            caption("Effects are unavailable")
-                                .frame(width, height - PLAYER_CLEARANCE)
-                                .safe_area_padding(SafeAreaEdges::ALL),
+                        page_in(
+                            region,
+                            header(header_title("Effects"), width),
+                            AnyView::new(caption("Effects are unavailable")),
+                            height,
+                            false,
                         )
                     }
                 }
             }
         };
+        if region == PageRegion::Header {
+            return content;
+        }
         let player_width = player_width(width - CHROME_MARGIN);
         AnyView::new(Surface::new(
             scarlet_ui::zstack! {
@@ -181,7 +188,12 @@ impl MainColumn {
     fn link(&self, title: &str, icon: Icon, tab: Tab) -> NavigationLink {
         let page = self.clone();
         let select = self.app.clone();
-        NavigationLink::new(title, move || page.page(tab))
+        let heading = self.clone();
+        NavigationLink::new(title, move || page.page(tab, PageRegion::Content))
+            .custom_header(
+                NavigationHeader::new(move || heading.page(tab, PageRegion::Header))
+                    .automatic_height(),
+            )
             .icon(icon)
             .on_select(move || {
                 select.collections.return_to_root();
@@ -213,6 +225,8 @@ impl MainColumn {
         // The canvas reaches the window edge; descendants reserve the full
         // sidebar width for controls and other meaningful content.
         .content_underlap(SIDEBAR_WIDTH)
+        .overlay_header(true)
+        .header_leading_overlap(CHROME_MARGIN)
         .shows_icons(true)
         .presentation(NavigationPresentation::Sidebar);
         let index = match self.app.workspace.tab.get() {
@@ -294,6 +308,7 @@ impl View for QueueSidebar {
 
 #[derive(Clone)]
 pub(crate) struct QueueFrame {
+    pub region: PageRegion,
     pub app: Cadence,
     pub width: f32,
     pub height: f32,
@@ -302,7 +317,7 @@ impl View for QueueFrame {
     fn create_element(&self) -> Box<dyn Element> {
         Box::new(scarlet_ui::ComponentElement::new_with_builder(
             self.clone(),
-            |v| Box::new(v.app.queue_view(v.width, v.height)),
+            |v| Box::new(v.app.queue_view(v.width, v.height, v.region)),
         ))
     }
     fn listenables(&self) -> Vec<&dyn Listenable> {
@@ -317,6 +332,7 @@ impl View for QueueFrame {
 }
 #[derive(Clone)]
 pub(crate) struct BrowserFrame {
+    pub region: PageRegion,
     pub app: Cadence,
     pub width: f32,
     pub height: f32,
@@ -325,7 +341,7 @@ impl View for BrowserFrame {
     fn create_element(&self) -> Box<dyn Element> {
         Box::new(scarlet_ui::ComponentElement::new_with_builder(
             self.clone(),
-            |v| Box::new(v.app.browser_view(v.width, v.height)),
+            |v| Box::new(v.app.browser_view(v.width, v.height, v.region)),
         ))
     }
     fn listenables(&self) -> Vec<&dyn Listenable> {

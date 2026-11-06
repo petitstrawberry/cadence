@@ -303,19 +303,27 @@ impl EffectPane {
             None
         }
     }
-    pub fn view(&self, width: f32, height: f32, browse: Rc<dyn Fn()>) -> AnyView {
+    pub fn view(
+        &self,
+        width: f32,
+        height: f32,
+        browse: Rc<dyn Fn()>,
+        region: PageRegion,
+    ) -> AnyView {
         AnyView::new(EffectFrame {
             pane: self.clone(),
+            region,
             width,
             height,
             browse,
         })
     }
-    fn body(&self, width: f32, height: f32, browse: Rc<dyn Fn()>) -> AnyView {
-        let discover = self.clone();
-        let scan = self.clone();
-        let submit = self.clone();
-        let body_height = (height - LIBRARY_HEADER_HEIGHT - 32.).max(120.);
+    fn body(&self, width: f32, height: f32, browse: Rc<dyn Fn()>, region: PageRegion) -> AnyView {
+        let heading = self.header(width, browse);
+        if region == PageRegion::Header {
+            return heading;
+        }
+        let body_height = (height - PLAYER_CLEARANCE - LIBRARY_HEADER_HEIGHT - 32.).max(120.);
         let initial_left = ((width - 1.) * 0.4).clamp(280., (width - 301.).max(280.));
         let chain_size = self.chain_size.get();
         let parameter_size = self.parameter_size.get();
@@ -357,8 +365,20 @@ impl EffectPane {
         .min_first(280.)
         .min_second(300.)
         .frame(width, body_height);
-        AnyView::new(Surface::new(vstack! {
-            header(hstack! {
+        page_in(region, heading, AnyView::new(vstack! {
+            panes,
+            HeaderBar::new(hstack! {
+                Text::from_state(self.status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()),
+                Spacer::new(),
+            }.padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))).chrome_style(ChromeStyle::Simple).height(32.),
+        }.spacing(0.).frame(content_width(width),body_height + 32.).repaint_boundary()), height, false)
+    }
+    fn header(&self, width: f32, browse: Rc<dyn Fn()>) -> AnyView {
+        let discover = self.clone();
+        let scan = self.clone();
+        let submit = self.clone();
+        header(
+            hstack! {
                 hstack! { header_title("Effects"), Spacer::new() }.frame(180.,32.),
                 TextField::new(self.path.clone()).placeholder("Choose an effect plug-in…")
                     .font_size(12.).padding(6.).on_submit(move || submit.discover())
@@ -369,13 +389,10 @@ impl EffectPane {
                     .on_click(move || discover.discover()).frame(92.,28.),
                 Button::icon_only(Icon::Refresh).header_style().icon_size(IconSize::Small)
                     .on_click(move || scan.scan_installed()).frame(28.,28.),
-            }.spacing(8.), width),
-            panes,
-            HeaderBar::new(hstack! {
-                Text::from_state(self.status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()),
-                Spacer::new(),
-            }.padding_insets(EdgeInsets::horizontal(CONTENT_PADDING))).chrome_style(ChromeStyle::Simple).height(32.),
-        }.spacing(0.), SurfaceRole::Canvas).frame(width,height).repaint_boundary())
+            }
+            .spacing(8.),
+            width,
+        )
     }
     fn chain_view(&self, width: f32, height: f32) -> AnyView {
         let snapshot = self.snapshot.borrow().clone();
@@ -535,6 +552,7 @@ impl EffectPane {
 
 #[derive(Clone)]
 struct EffectFrame {
+    region: PageRegion,
     pane: EffectPane,
     width: f32,
     height: f32,
@@ -545,11 +563,12 @@ impl View for EffectFrame {
         Box::new(scarlet_ui::ComponentElement::new_with_builder(
             self.clone(),
             |frame| {
-                Box::new(
-                    frame
-                        .pane
-                        .body(frame.width, frame.height, frame.browse.clone()),
-                )
+                Box::new(frame.pane.body(
+                    frame.width,
+                    frame.height,
+                    frame.browse.clone(),
+                    frame.region,
+                ))
             },
         ))
     }

@@ -2694,58 +2694,69 @@ fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
             .iter()
             .find_map(|child| first_rect(child.as_ref(), origin, predicate))
     }
-    fn assert_scroll_canvas(element: &dyn Element, sidebar_edge: f32) {
-        if element
-            .type_name_debug()
-            .starts_with("RenderElement<scarlet_ui_core::views::content_shell::ContentShell<")
-        {
-            let content = element.children()[0].as_ref();
-            let scroll = first_rect(content, Point::ZERO, |e| {
-                e.type_name_debug()
-                    .starts_with("RenderElement<scarlet_ui_core::views::scroll::ScrollView<")
-            })
-            .unwrap();
-            assert_eq!(
-                scroll.origin,
-                Point::ZERO,
-                "The scroll canvas must reach the window top and left"
+    fn assert_scroll_canvas(nav: &dyn Element, sidebar_edge: f32) {
+        assert_eq!(
+            nav.children().len(),
+            3,
+            "navigation owns content, custom header, and sidebar"
+        );
+        let content = nav.children()[0].as_ref();
+        let scroll = first_rect(content, Point::ZERO, |e| {
+            e.type_name_debug()
+                .starts_with("RenderElement<scarlet_ui_core::views::scroll::ScrollView<")
+        })
+        .expect("page must have a scrollport");
+        assert_eq!(
+            scroll.origin,
+            Point::ZERO,
+            "scroll canvas reaches the window top and left"
+        );
+        assert_eq!(
+            scroll.size,
+            nav.bounds().size,
+            "header/player reservations must not shorten the viewport"
+        );
+        assert!(
+            first_rect(content, Point::ZERO, |e| e.type_name_debug().starts_with(
+                "RenderElement<scarlet_ui_core::views::content_shell::ContentShell<"
+            ))
+            .is_none(),
+            "main pages must not keep a second header shell"
+        );
+        let header = first_rect(nav.children()[1].as_ref(), Point::ZERO, |e| {
+            e.render_object()
+                .is_some_and(|r| r.as_any().is::<scarlet_ui::views::HeaderBarRenderObject>())
+        })
+        .unwrap();
+        assert_eq!(
+            header.left(),
+            sidebar_edge,
+            "sidebar and header margins were added twice"
+        );
+        fn safe_rect(element: &dyn Element, parent: Point, left: f32) -> Option<Rect> {
+            let origin = Point::new(
+                parent.x + element.position().x,
+                parent.y + element.position().y,
             );
-            assert_eq!(
-                scroll.size,
-                element.bounds().size,
-                "Header/player reservations must not shorten the scroll canvas"
-            );
-            let header = first_rect(element.children()[1].as_ref(), Point::ZERO, |e| {
-                e.render_object()
-                    .is_some_and(|r| r.as_any().is::<scarlet_ui::views::HeaderBarRenderObject>())
-            })
-            .unwrap();
-            // The sidebar already supplies the one 8px gap at its trailing edge.
-            assert_eq!(
-                header.left(),
-                sidebar_edge,
-                "Sidebar and header margins were added twice"
-            );
-            let scope = content
+            if let Some(scope) = element
                 .render_object()
-                .unwrap()
-                .as_any()
-                .downcast_ref::<ContentInsetsRenderObject>()
-                .unwrap();
-            let safe =
-                Rect::new(content.position(), content.bounds().size).inset(scope.content_insets());
-            assert_eq!(safe.left(), header.left());
-            assert_eq!(safe.right(), header.right());
-            assert_eq!(safe.top(), element.children()[1].bounds().bottom());
-            assert_eq!(
-                safe.bottom(),
-                element.bounds().size.height - PLAYER_CLEARANCE
-            );
-            return;
+                .and_then(|r| r.as_any().downcast_ref::<ContentInsetsRenderObject>())
+            {
+                let safe = Rect::new(origin, element.bounds().size).inset(scope.content_insets());
+                if safe.left() == left {
+                    return Some(safe);
+                }
+            }
+            element
+                .children()
+                .iter()
+                .find_map(|child| safe_rect(child.as_ref(), origin, left))
         }
-        for child in element.children() {
-            assert_scroll_canvas(child.as_ref(), sidebar_edge);
-        }
+        let safe = safe_rect(content, Point::ZERO, sidebar_edge).expect("safe content scope");
+        assert_eq!(safe.left(), header.left());
+        assert_eq!(safe.right(), header.right());
+        assert_eq!(safe.top(), nav.children()[1].bounds().bottom());
+        assert_eq!(safe.bottom(), nav.bounds().size.height - PLAYER_CLEARANCE);
     }
     fn navigation(element: &dyn Element) -> Option<&dyn Element> {
         if element.render_object().is_some_and(|render| {
@@ -2786,7 +2797,7 @@ fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
                 "Canvas continues beneath the whole sidebar"
             );
             let safe_left = nav.children().last().unwrap().bounds().right();
-            assert_scroll_canvas(canvas, safe_left);
+            assert_scroll_canvas(nav, safe_left);
             let mut content_targets = Vec::new();
             controls(canvas, Point::ZERO, &mut content_targets, false);
             for target in content_targets {
@@ -3348,6 +3359,7 @@ fn automatic_queue_advance_paints_only_the_current_row() {
     let mut tree = ElementTree::new();
     tree.set_root(
         presentation::QueueFrame {
+            region: PageRegion::Standalone,
             app: app.clone(),
             width: 900.,
             height: 650.,
@@ -3371,4 +3383,53 @@ fn automatic_queue_advance_paints_only_the_current_row() {
         assert!((found[0].y - y - index as f32 * 52.).abs() <= 0.5);
     }
     tree.clear_root();
+}
+
+#[test]
+fn navigation_owns_live_queue_header_extensions_without_rebuilding_the_shell() {
+    fn navigation(element: &dyn Element) -> Option<&dyn Element> {
+        if element.render_object().is_some_and(|render| {
+            render
+                .as_any()
+                .is::<scarlet_ui::views::navigation::NavigationViewRenderObject>()
+        }) {
+            return Some(element);
+        }
+        element
+            .children()
+            .iter()
+            .find_map(|child| navigation(child.as_ref()))
+    }
+    let app = app();
+    app.workspace.tab.set(Tab::Playing);
+    app.shell.queue_visible.set(false);
+    let mut pipeline = scarlet_ui::RenderingPipeline::new();
+    pipeline.set_root(app.window(Size::new(900., 600.)).create_element());
+    pipeline.layout_initial();
+    settle_render(&mut pipeline);
+    let counts = build_counts(&app);
+    let nav_id = navigation(pipeline.element_tree().root().unwrap())
+        .unwrap()
+        .id();
+    for (populated, height) in [
+        (true, LIBRARY_HEADER_HEIGHT + COLUMN_HEADER_HEIGHT),
+        (false, LIBRARY_HEADER_HEIGHT),
+        (true, LIBRARY_HEADER_HEIGHT + COLUMN_HEADER_HEIGHT),
+    ] {
+        app.playback
+            .queue
+            .tracks
+            .set(if populated { tracks() } else { vec![] });
+        settle_render(&mut pipeline);
+        let nav = navigation(pipeline.element_tree().root().unwrap()).unwrap();
+        assert_eq!(nav.id(), nav_id);
+        assert_eq!(nav.children().len(), 3);
+        assert_eq!(nav.children()[1].bounds().size.height, height);
+        assert_eq!(
+            &build_counts(&app)[..3],
+            &counts[..3],
+            "header changes must not rebuild the outer navigation"
+        );
+    }
+    pipeline.teardown();
 }

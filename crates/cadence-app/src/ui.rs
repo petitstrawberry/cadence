@@ -150,9 +150,67 @@ pub fn column_header(content: impl View + Clone + 'static, width: f32) -> AnyVie
     AnyView::new(chrome_bar(content, width, 28.).padding_insets(EdgeInsets::only_bottom(8.)))
 }
 
+/// Select a page's navigation-owned header or body without adding another shell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageRegion {
+    Standalone,
+    Header,
+    Content,
+}
+
+pub(crate) fn page_in(
+    region: PageRegion,
+    header: AnyView,
+    content: AnyView,
+    height: f32,
+    scrolling: bool,
+) -> AnyView {
+    page_with_header_height_in(
+        region,
+        header,
+        content,
+        height,
+        LIBRARY_HEADER_HEIGHT,
+        scrolling,
+    )
+}
+
+pub(crate) fn page_with_header_height_in(
+    region: PageRegion,
+    header: AnyView,
+    content: AnyView,
+    height: f32,
+    header_height: f32,
+    scrolling: bool,
+) -> AnyView {
+    match region {
+        PageRegion::Header => AnyView::new(header.frame_height(header_height)),
+        PageRegion::Content => {
+            let content = if scrolling {
+                content
+            } else {
+                AnyView::new(content.safe_area_padding(SafeAreaEdges::ALL))
+            };
+            AnyView::new(
+                Surface::new(
+                    ContentInsets {
+                        content: crate::layout_debug::inspect_safe_area(content),
+                        adjustment: EdgeInsets::horizontal(CHROME_MARGIN),
+                    },
+                    SurfaceRole::Canvas,
+                )
+                .frame(f32::INFINITY, height),
+            )
+        }
+        PageRegion::Standalone => {
+            page_with_header_height(header, content, height, header_height, scrolling)
+        }
+    }
+}
+
 /// Keep fixed content safe; let scrollports fill the canvas behind chrome.
 pub fn page(header: AnyView, content: AnyView, height: f32, scrolling: bool) -> AnyView {
-    page_with_header_height(header, content, height, LIBRARY_HEADER_HEIGHT, scrolling)
+    page_in(PageRegion::Standalone, header, content, height, scrolling)
 }
 
 pub fn page_with_header_height(

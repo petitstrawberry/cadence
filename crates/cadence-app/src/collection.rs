@@ -7,8 +7,8 @@ use crate::{
     extension::{Tab, Workspace},
     state,
     ui::{
-        AnyView, CONTENT_PADDING, back_header, button, caption, clock, content_width, counted,
-        library_header, page, scroll_content_padding, selected_color, text, truncate,
+        AnyView, CONTENT_PADDING, PageRegion, back_header, button, caption, clock, content_width,
+        counted, library_header, page_in, scroll_content_padding, selected_color, text, truncate,
     },
 };
 use cadence_library::{ArtworkRef, LibraryTrack, MediaLocation};
@@ -188,10 +188,18 @@ impl Collections {
         self.covers.poll();
     }
 
-    pub fn view(&self, app: &Cadence, kind: CollectionKind, width: f32, height: f32) -> AnyView {
+    pub fn view(
+        &self,
+        app: &Cadence,
+        kind: CollectionKind,
+        width: f32,
+        height: f32,
+        region: PageRegion,
+    ) -> AnyView {
         AnyView::new(CollectionPane {
             app: app.clone(),
             collections: self.clone(),
+            region,
             kind,
             width,
             height,
@@ -432,6 +440,7 @@ fn filter_groups(groups: Vec<Group>, query: &str) -> Vec<Group> {
 
 #[derive(Clone)]
 struct CollectionPane {
+    region: PageRegion,
     app: Cadence,
     collections: Collections,
     kind: CollectionKind,
@@ -449,7 +458,8 @@ impl CollectionPane {
             if let Some(artist) = self.collections.selected_artist.get() {
                 let back = self.collections.clone();
                 let groups = self.collections.artist_albums.clone();
-                return page(
+                return page_in(
+                    self.region,
                     back_header(
                         &artist.title,
                         AnyView::new(
@@ -501,7 +511,8 @@ impl CollectionPane {
         } else {
             self.album_grid(groups)
         };
-        page(
+        page_in(
+            self.region,
             library_header(
                 &self.app,
                 if self.kind == CollectionKind::Albums {
@@ -619,7 +630,7 @@ impl CollectionPane {
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             > 1;
-        page(
+        page_in(self.region,
             back_header(&parent,AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || back.detail.set(None)),
             AnyView::new(ScrollView::new(vstack! {
             hstack! {

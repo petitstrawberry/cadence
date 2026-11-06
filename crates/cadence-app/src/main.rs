@@ -338,7 +338,7 @@ impl Cadence {
     fn track_info(&self, width: f32) -> AnyView {
         transport::track_info(self, width)
     }
-    fn queue_view(&self, width: f32, height: f32) -> AnyView {
+    fn queue_view(&self, width: f32, height: f32, region: PageRegion) -> AnyView {
         #[cfg(test)]
         self.builds.queue.set(self.builds.queue.get() + 1);
         let clear = self.clone();
@@ -409,7 +409,7 @@ impl Cadence {
                 width,
             )
         };
-        page_with_header_height(AnyView::new(vstack! {
+        page_with_header_height_in(region, AnyView::new(vstack! {
             header(hstack! {
                 header_title("Play queue"), caption(counted(count,"song")), Spacer::new(),
                 button("Add files…").header_style().icon(Icon::Plus).on_click(move || add.open()).frame(116.,32.),
@@ -423,7 +423,7 @@ impl Cadence {
         self.builds.transport.set(self.builds.transport.get() + 1);
         transport::view(self, width)
     }
-    fn browser_view(&self, width: f32, height: f32) -> AnyView {
+    fn browser_view(&self, width: f32, height: f32, region: PageRegion) -> AnyView {
         let parent = self.clone();
         let go = self.clone();
         let folder = self.clone();
@@ -431,7 +431,7 @@ impl Cadence {
         let file = self.clone();
         let close = self.clone();
         let app = self.clone();
-        page(
+        page_in(region,
             header(hstack! {
                 header_title("Browse files"), Spacer::new(),
                 button("Done").header_style().on_click(move || close.browser.visible.set(false)).frame(64., 28.),

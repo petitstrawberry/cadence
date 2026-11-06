@@ -1389,16 +1389,30 @@ impl Workspace {
         }
         self.library_status.set("Cancelling scan…".into());
     }
-    pub fn library_view(&self, app: &Cadence, width: f32, height: f32) -> AnyView {
+    pub fn library_view(
+        &self,
+        app: &Cadence,
+        width: f32,
+        height: f32,
+        region: PageRegion,
+    ) -> AnyView {
         AnyView::new(LibraryPane {
+            region,
             app: app.clone(),
             width,
             height,
         })
     }
 
-    pub fn sources_view(&self, app: &Cadence, width: f32, height: f32) -> AnyView {
+    pub fn sources_view(
+        &self,
+        app: &Cadence,
+        width: f32,
+        height: f32,
+        region: PageRegion,
+    ) -> AnyView {
         AnyView::new(SourcesPane {
+            region,
             app: app.clone(),
             width,
             height,
@@ -1409,6 +1423,7 @@ impl Workspace {
 // recreate these views; ListView owns the row and scroll subscriptions.
 #[derive(Clone)]
 struct LibraryPane {
+    region: PageRegion,
     app: Cadence,
     width: f32,
     height: f32,
@@ -1468,7 +1483,7 @@ impl LibraryPane {
                 },
             ).item_key(|track| track.id.clone().into()).frame(f32::INFINITY, f32::INFINITY))
         };
-        page_with_header_height(
+        page_with_header_height_in(self.region,
             AnyView::new(vstack! {
                 library_header(&self.app, "All songs", format!("{} songs", workspace.filtered.get().len()), workspace.query.clone(), "Search title, artist, or album", width),
                 column_header(hstack! {
@@ -1503,6 +1518,7 @@ impl View for LibraryPane {
 
 #[derive(Clone)]
 struct SourcesPane {
+    region: PageRegion,
     app: Cadence,
     width: f32,
     height: f32,
@@ -1566,7 +1582,8 @@ impl SourcesPane {
                     .on_click(move || app.workspace.open_provider(&app, row.id.clone()))
             }).item_key(|row| format!("{:?}", row.id).into()).frame(f32::INFINITY, f32::INFINITY))
         };
-        page(
+        page_in(
+            self.region,
             self.heading(
                 "Sources",
                 counted(count, "source"),
@@ -1618,7 +1635,7 @@ impl SourcesPane {
                     .alignment(Alignment::Leading).frame(form_width,40.),
             }.spacing(10.))
         };
-        page(
+        page_in(self.region,
             back_header("Add source",AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || back.source_page.set(SourcePage::Overview)),
             AnyView::new(vstack! {
                 caption("Source type").alignment(Alignment::Leading).frame(form_width,20.),
@@ -1654,7 +1671,7 @@ impl SourcesPane {
                 },
             }.spacing(8.))
         };
-        page(
+        page_in(self.region,
             back_header("Client certificate",AnyView::new(Spacer::new().frame(0.,32.)),0.,width,move || {
                 back.certificate_secret.clear();
                 back.source_page.set(SourcePage::Browse);
@@ -1931,7 +1948,7 @@ impl SourcesPane {
                     .background(catalog_row_color(selection == Some(index), index))
             }).frame(content_width(width),content_height))
         };
-        page(
+        page_in(self.region,
             back_header(&title,AnyView::new(hstack! { refresh, remove_action }.spacing(8.)),220.,width,move || back.workspace.back_in_source(&back)),
             AnyView::new(vstack! {
             caption(truncate(&workspace.source_status.get(), ((width - 40.) / 6.5).max(1.) as usize)).font_size(11.).alignment(Alignment::Leading)
