@@ -1,5 +1,6 @@
 //! Shared visual tokens and type-erased composition for ScarletUI.
 use scarlet_ui::{
+    NavigationLink, NavigationView,
     element::{ElementRenderObject, RenderElement, UpdateResult},
     prelude::*,
 };
@@ -86,7 +87,7 @@ pub fn selected_color() -> Color {
 }
 
 /// One set of metrics for every page and panel header.
-pub const LIBRARY_HEADER_HEIGHT: f32 = 64.;
+pub const LIBRARY_HEADER_HEIGHT: f32 = 48.;
 pub const COLUMN_HEADER_HEIGHT: f32 = 36.;
 pub const PAGE_PADDING: f32 = 20.;
 pub const PLAYER_HEIGHT: f32 = 64.;
@@ -94,20 +95,19 @@ pub const PLAYER_BOTTOM_MARGIN: f32 = 12.;
 pub const FLOATING_CONTENT_GAP: f32 = 16.;
 // Floating chrome owns its content reservation: body + outer margin + gap.
 pub const PLAYER_CLEARANCE: f32 = PLAYER_HEIGHT + PLAYER_BOTTOM_MARGIN + FLOATING_CONTENT_GAP;
-/// Gap outside the material outline. Shadows do not change the safe width.
-pub const CHROME_MARGIN: f32 = 8.;
-pub const CONTENT_PADDING: f32 = PAGE_PADDING - CHROME_MARGIN;
+/// Internal spacing between the body outline and its controls.
+pub const CONTENT_PADDING: f32 = 12.;
 
 pub fn content_width(page_width: f32) -> f32 {
-    (page_width - CHROME_MARGIN * 2.).max(0.)
+    page_width.max(0.)
 }
 
-/// Share the sidebar's trailing gap and reserve the floating player once.
-/// Both reservations affect usable content, never the canvas dimensions.
+/// Reserve the floating player once without changing the canvas dimensions.
 pub fn main_content(content: AnyView) -> AnyView {
     AnyView::new(ContentInsets {
         content,
-        adjustment: EdgeInsets::new(-CHROME_MARGIN, 0., 0., PLAYER_CLEARANCE),
+        adjustment: EdgeInsets::ZERO,
+        minimum_bottom: PLAYER_CLEARANCE,
     })
 }
 
@@ -116,11 +116,12 @@ pub fn scroll_content_padding(content: AnyView, insets: EdgeInsets) -> AnyView {
     AnyView::new(ContentInsets {
         content,
         adjustment: insets,
+        minimum_bottom: 0.,
     })
 }
 
 /// Shared material and horizontal geometry for full and compact chrome.
-fn chrome_bar(content: impl View + Clone + 'static, width: f32, height: f32) -> AnyView {
+fn chrome_bar(content: impl View + Clone + 'static, _width: f32, height: f32) -> AnyView {
     AnyView::new(
         chrome_surface(
             HeaderBar::new(content.padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)))
@@ -128,8 +129,7 @@ fn chrome_bar(content: impl View + Clone + 'static, width: f32, height: f32) -> 
                 .surface(Color::CLEAR)
                 .separator(Color::CLEAR),
         )
-        .frame(content_width(width), height)
-        .padding_insets(EdgeInsets::horizontal(CHROME_MARGIN)),
+        .frame(f32::INFINITY, height),
     )
 }
 
@@ -142,12 +142,12 @@ pub fn chrome_surface<V: View>(content: V) -> Surface<V> {
 
 /// Shared inset chrome; its backing samples the content painted beneath it.
 pub fn header(content: impl View + Clone + 'static, width: f32) -> AnyView {
-    AnyView::new(chrome_bar(content, width, 48.).padding_insets(EdgeInsets::vertical(8.)))
+    chrome_bar(content, width, 48.)
 }
 
 /// Compact column labels use the same inset and rounded material as the toolbar.
 pub fn column_header(content: impl View + Clone + 'static, width: f32) -> AnyView {
-    AnyView::new(chrome_bar(content, width, 28.).padding_insets(EdgeInsets::only_bottom(8.)))
+    AnyView::new(chrome_bar(content, width, 28.).padding_insets(EdgeInsets::only_top(8.)))
 }
 
 /// Select a page's navigation-owned header or body without adding another shell.
@@ -165,26 +165,8 @@ pub(crate) fn page_in(
     height: f32,
     scrolling: bool,
 ) -> AnyView {
-    page_with_header_height_in(
-        region,
-        header,
-        content,
-        height,
-        LIBRARY_HEADER_HEIGHT,
-        scrolling,
-    )
-}
-
-pub(crate) fn page_with_header_height_in(
-    region: PageRegion,
-    header: AnyView,
-    content: AnyView,
-    height: f32,
-    header_height: f32,
-    scrolling: bool,
-) -> AnyView {
     match region {
-        PageRegion::Header => AnyView::new(header.frame_height(header_height)),
+        PageRegion::Header => header,
         PageRegion::Content => {
             let content = if scrolling {
                 content
@@ -193,18 +175,13 @@ pub(crate) fn page_with_header_height_in(
             };
             AnyView::new(
                 Surface::new(
-                    ContentInsets {
-                        content: crate::layout_debug::inspect_safe_area(content),
-                        adjustment: EdgeInsets::horizontal(CHROME_MARGIN),
-                    },
+                    crate::layout_debug::inspect_safe_area(content),
                     SurfaceRole::Canvas,
                 )
-                .frame(f32::INFINITY, height),
+                .frame(f32::INFINITY, f32::INFINITY),
             )
         }
-        PageRegion::Standalone => {
-            page_with_header_height(header, content, height, header_height, scrolling)
-        }
+        PageRegion::Standalone => standalone_page(header, content, height, scrolling),
     }
 }
 
@@ -213,33 +190,18 @@ pub fn page(header: AnyView, content: AnyView, height: f32, scrolling: bool) -> 
     page_in(PageRegion::Standalone, header, content, height, scrolling)
 }
 
-pub fn page_with_header_height(
-    header: AnyView,
-    content: AnyView,
-    height: f32,
-    header_height: f32,
-    scrolling: bool,
-) -> AnyView {
+fn standalone_page(header: AnyView, content: AnyView, height: f32, scrolling: bool) -> AnyView {
     let content = if scrolling {
         content
     } else {
-        AnyView::new(content.safe_area_padding(SafeAreaEdges::HORIZONTAL))
-    };
-    let content = ContentInsets {
-        content: crate::layout_debug::inspect_safe_area(content),
-        adjustment: EdgeInsets::horizontal(CHROME_MARGIN),
-    };
-    let shell = if scrolling {
-        ContentShell::scrolling(content)
-    } else {
-        ContentShell::new(content)
+        AnyView::new(content.safe_area_padding(SafeAreaEdges::ALL))
     };
     AnyView::new(
-        Surface::new(
-            shell.header(header, header_height).underlap(header_height),
-            SurfaceRole::Canvas,
-        )
-        .frame(f32::INFINITY, height),
+        NavigationView::new((NavigationLink::new("", move || content.clone()),))
+            .sidebar_width(0.)
+            .presentation(NavigationPresentation::Sidebar)
+            .custom_header(NavigationHeader::new(move || header.clone()).automatic_height())
+            .frame(f32::INFINITY, height),
     )
 }
 
@@ -249,6 +211,7 @@ pub fn page_with_header_height(
 struct ContentInsets {
     content: AnyView,
     adjustment: EdgeInsets,
+    minimum_bottom: f32,
 }
 
 impl View for ContentInsets {
@@ -257,13 +220,17 @@ impl View for ContentInsets {
             self.clone(),
             |view| ContentInsetsRenderObject {
                 adjustment: view.adjustment,
+                minimum_bottom: view.minimum_bottom,
                 ..Default::default()
             },
             |render, view| {
-                if render.adjustment == view.adjustment {
+                if render.adjustment == view.adjustment
+                    && render.minimum_bottom == view.minimum_bottom
+                {
                     return UpdateResult::NoChange;
                 }
                 render.adjustment = view.adjustment;
+                render.minimum_bottom = view.minimum_bottom;
                 UpdateResult::Updated
             },
             |view| vec![Box::new(view.content.clone())],
@@ -284,6 +251,7 @@ pub(crate) struct ContentInsetsRenderObject {
     size: Size,
     insets: EdgeInsets,
     adjustment: EdgeInsets,
+    minimum_bottom: f32,
 }
 
 impl ContentInsetsRenderObject {
@@ -303,7 +271,7 @@ impl ElementRenderObject for ContentInsetsRenderObject {
             (insets.left + self.adjustment.left).max(0.),
             (insets.top + self.adjustment.top).max(0.),
             (insets.right + self.adjustment.right).max(0.),
-            (insets.bottom + self.adjustment.bottom).max(0.),
+            (insets.bottom + self.adjustment.bottom).max(self.minimum_bottom),
         )
     }
 

@@ -323,7 +323,7 @@ impl EffectPane {
         if region == PageRegion::Header {
             return heading;
         }
-        let body_height = (height - PLAYER_CLEARANCE - LIBRARY_HEADER_HEIGHT - 32.).max(120.);
+        let body_height = (height - 32.).max(120.);
         let initial_left = ((width - 1.) * 0.4).clamp(280., (width - 301.).max(280.));
         let chain_size = self.chain_size.get();
         let parameter_size = self.parameter_size.get();
@@ -409,7 +409,6 @@ impl EffectPane {
         } else {
             (snapshot.discovered.len() as f32 * 36.).clamp(36., 108.)
         };
-        let chain_height = (height - available_height - LIBRARY_HEADER_HEIGHT * 2.).max(40.);
         let chain = if snapshot.effects.is_empty() {
             AnyView::new(
                 vstack! {
@@ -419,7 +418,7 @@ impl EffectPane {
                 .spacing(6.)
                 .alignment(Alignment::TopLeading)
                 .padding(CONTENT_PADDING)
-                .frame(width, chain_height),
+                .frame(width, f32::INFINITY),
             )
         } else {
             AnyView::new(ListView::new(effects,self.selected.clone(),46.,move |index,effect,selected| {
@@ -435,7 +434,7 @@ impl EffectPane {
                 }.spacing(6.).padding(6.).frame(width - 8.,46.)
                     .background(if selected == Some(index) { selected_color() } else { palette.background() })
                     .on_click(move || select.select(index))
-            }).frame(width,chain_height))
+            }).frame(width,f32::INFINITY))
         };
         let available = if snapshot.discovered.is_empty() {
             AnyView::new(
@@ -508,7 +507,7 @@ impl EffectPane {
                 Text::new(if selected.is_some() { "No adjustable parameters" } else { "Select an effect" }).font_size(14.),
                 caption(if selected.is_some() { "This plug-in has no generic controls." } else { "Choose an effect from the chain." }).font_size(11.),
                 Spacer::new(),
-            }.spacing(10.).frame(width,(height - LIBRARY_HEADER_HEIGHT).max(40.)))
+            }.spacing(10.).frame(width,f32::INFINITY))
         } else {
             AnyView::new(ListView::new(self.parameters.clone(),self.parameter_selection.clone(),68.,move |_,row,_| {
                 let parameter = row.parameter.clone();
@@ -533,7 +532,7 @@ impl EffectPane {
                 }.spacing(4.).frame_width(width - 40.))
                     .alignment(Alignment::Leading).frame(width - 40.,68.)
                     .padding_insets(EdgeInsets::horizontal(CONTENT_PADDING)).frame(width,68.)
-            }).frame(width,(height - LIBRARY_HEADER_HEIGHT).max(40.)))
+            }).frame(width,f32::INFINITY))
         };
         AnyView::new(
             Surface::new(

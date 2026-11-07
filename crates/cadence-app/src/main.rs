@@ -348,8 +348,7 @@ impl Cadence {
         let album_width = ((inner - 152.) * 0.3).max(80.);
         let title_width = inner - album_width - 152.;
         let app = self.clone();
-        let body_height =
-            height - LIBRARY_HEADER_HEIGHT - if count == 0 { 0. } else { COLUMN_HEADER_HEIGHT };
+        let body_height = height;
         let content = if count == 0 {
             AnyView::new(vstack! {
                 Spacer::new(),
@@ -357,7 +356,7 @@ impl Cadence {
                 text("Your queue is empty").font_size(18.),
                 caption("Play a song from your library to start listening."),
                 Spacer::new(),
-            }.spacing(12.).frame(content_width(width), (body_height - PLAYER_CLEARANCE).max(0.)))
+            }.spacing(12.).frame(content_width(width), (body_height).max(0.)))
         } else {
             AnyView::new(ListView::new(self.playback.queue.tracks.clone(), self.playback.queue.selected.clone(), 52., move |index, track, _selected| {
                 let choose = app.clone();
@@ -409,14 +408,14 @@ impl Cadence {
                 width,
             )
         };
-        page_with_header_height_in(region, AnyView::new(vstack! {
+        page_in(region, AnyView::new(vstack! {
             header(hstack! {
                 header_title("Play queue"), caption(counted(count,"song")), Spacer::new(),
                 button("Add files…").header_style().icon(Icon::Plus).on_click(move || add.open()).frame(116.,32.),
                 clear_action,
             }.spacing(12.),width),
             columns,
-        }.spacing(0.)), content, height, LIBRARY_HEADER_HEIGHT + if count == 0 { 0. } else { COLUMN_HEADER_HEIGHT }, count > 0)
+        }.spacing(0.)), content, height, count > 0)
     }
     fn transport(&self, width: f32) -> AnyView {
         #[cfg(test)]
@@ -440,7 +439,7 @@ impl Cadence {
             hstack! {
                 Button::icon_only(Icon::ArrowUp).header_style().on_click(move || { let path = PathBuf::from(parent.browser.directory.get()); if let Some(path) = path.parent() { parent.read_directory(path.into()); } }).frame(30., 30.),
                 TextField::new(self.browser.directory.clone()).font_size(13.).on_submit(move || go.read_directory(PathBuf::from(go.browser.directory.get()))).on_key(|_| true).frame(width - 76., 30.),
-            }.spacing(8.).padding_insets(EdgeInsets::horizontal(16. - CHROME_MARGIN)),
+            }.spacing(8.).padding_insets(EdgeInsets::horizontal(8.)),
             ListView::new(self.browser.entries.clone(), self.browser.selection.clone(), 32., move |index, entry, selected| {
                 let app = app.clone();
                 hstack! {
@@ -450,15 +449,15 @@ impl Cadence {
                 }.spacing(8.).padding_insets(EdgeInsets::new(12., 0., 12., 0.)).frame(width - 44., 32.)
                     .background(if selected == Some(index) { selected_color() } else { ColorPalette::default().background() })
                     .on_click(move || if entry.directory { app.read_directory(entry.path.clone()); } else { app.browser.selection.set(Some(index)); })
-            }).frame(width - 32., height - PLAYER_CLEARANCE - 160.).padding_insets(EdgeInsets::horizontal(16. - CHROME_MARGIN)),
-            Text::from_state(self.browser.status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(16. - CHROME_MARGIN)).frame(content_width(width), 20.),
+            }).frame(width - 32., height - 160.).padding_insets(EdgeInsets::horizontal(8.)),
+            Text::from_state(self.browser.status.clone()).font_size(11.).color(ColorPalette::default().text_secondary()).alignment(Alignment::Leading).padding_insets(EdgeInsets::horizontal(8.)).frame(content_width(width), 20.),
             HeaderBar::new(hstack! {
                 button("Add folder to queue").on_click(move || { folder.add(folder.browser.entries.get().into_iter().filter(|e| !e.directory).map(|e| e.path).collect()); folder.browser.visible.set(false); }).frame(154., 28.),
                 button("Import to library").on_click(move || { import.workspace.add_folder_source(&import, PathBuf::from(import.browser.directory.get())); import.workspace.tab.set(Tab::Sources); import.browser.visible.set(false); }).frame(142., 28.),
                 Spacer::new(),
                 button("Add selected").on_click(move || if let Some(entry) = file.browser.selection.get().and_then(|i| file.browser.entries.get().get(i).cloned()) && !entry.directory { file.add(vec![entry.path]); file.browser.visible.set(false); }).frame(116., 28.),
-            }.spacing(8.).padding_insets(EdgeInsets::horizontal(16. - CHROME_MARGIN))).height(38.),
-        }.spacing(6.).frame(content_width(width), height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE)), height, false)
+            }.spacing(8.).padding_insets(EdgeInsets::horizontal(8.))).height(38.),
+        }.spacing(6.).frame(content_width(width), height)), height, false)
     }
     fn body(&self) -> AnyView {
         #[cfg(test)]

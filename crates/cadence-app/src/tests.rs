@@ -2755,7 +2755,7 @@ fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
         let safe = safe_rect(content, Point::ZERO, sidebar_edge).expect("safe content scope");
         assert_eq!(safe.left(), header.left());
         assert_eq!(safe.right(), header.right());
-        assert_eq!(safe.top(), nav.children()[1].bounds().bottom());
+        assert_eq!(safe.top(), nav.children()[1].bounds().bottom() + 8.);
         assert_eq!(safe.bottom(), nav.bounds().size.height - PLAYER_CLEARANCE);
     }
     fn navigation(element: &dyn Element) -> Option<&dyn Element> {
@@ -2796,7 +2796,7 @@ fn library_search_headers_share_geometry_and_artist_detail_controls_fit() {
                 nav.bounds().size,
                 "Canvas continues beneath the whole sidebar"
             );
-            let safe_left = nav.children().last().unwrap().bounds().right();
+            let safe_left = nav.children().last().unwrap().bounds().right() + 8.;
             assert_scroll_canvas(nav, safe_left);
             let mut content_targets = Vec::new();
             controls(canvas, Point::ZERO, &mut content_targets, false);
@@ -2911,7 +2911,9 @@ fn page_and_queue_headers_have_one_shared_height_and_player_has_its_own_width() 
                     "Header title is not aligned in {mode}: {label:?}"
                 );
                 assert!(
-                    (label.origin.y + label.size.height * 0.5 - LIBRARY_HEADER_HEIGHT * 0.5).abs()
+                    (label.origin.y + label.size.height * 0.5
+                        - (main.top() + main.size.height * 0.5))
+                        .abs()
                         < 0.5,
                     "Header title is not vertically centered in {mode}: {label:?}"
                 );
@@ -2929,7 +2931,7 @@ fn page_and_queue_headers_have_one_shared_height_and_player_has_its_own_width() 
                 );
             }
             let player = transport_boundary(tree.root().unwrap(), Point::ZERO).unwrap();
-            assert_eq!(player.size.width, player_width(main_width + CHROME_MARGIN));
+            assert_eq!(player.size.width, player_width(main_width));
             assert!(
                 player.size.width < main_width - 40.,
                 "Player should have more space around it than the artwork grid"
@@ -3274,13 +3276,10 @@ fn transport_stays_at_page_center_after_resize_queue_and_playback_changes() {
                 } else {
                     "icon:PlayerPlay"
                 });
-                let primary_width = width
-                    - if queue_visible && width >= 1160. {
-                        280.
-                    } else {
-                        0.
-                    };
-                let expected = 184. + (primary_width - 184.) / 2.;
+                // Center on the allocated safe content, including the split
+                // divider and both chrome margins, rather than a guessed rail width.
+                let player = transport_boundary(tree.root().unwrap(), Point::ZERO).unwrap();
+                let expected = player.origin.x + player.size.width * 0.5;
                 assert!(
                     (center(play) - expected).abs() <= 0.5,
                     "Transport moved at width={width}, queue={queue_visible}, repeat={repeat:?}: {play:?}, expected={expected}"
