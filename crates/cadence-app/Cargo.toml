@@ -14,10 +14,10 @@ serde_json = "1"
 zeroize = "=1.9.0"
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "5a6c94be6a76a32f2be701c3fa0b4746e720cba8", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "7056bd9f79b2547f46d80509bfe34339babbb369", default-features = false, features = ["std", "platform-winit"] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "5a6c94be6a76a32f2be701c3fa0b4746e720cba8", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "7056bd9f79b2547f46d80509bfe34339babbb369", default-features = false, features = ["std", "platform-sws"] }
 
 [build-dependencies]
 toml = "=1.1.2"

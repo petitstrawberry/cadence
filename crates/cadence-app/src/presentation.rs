@@ -1,7 +1,7 @@
 //! Independent presentation boundaries. None forwards descendant listenables.
 use super::*;
 
-const SIDEBAR_WIDTH: f32 = 184.;
+const SIDEBAR_WIDTH: f32 = 168.;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -19,6 +19,7 @@ pub(crate) struct ShellState {
     pub(super) queue_visible: State<bool>,
     primary_size: State<Size>,
     queue_size: State<Size>,
+    body_size: State<Size>,
 }
 impl ShellState {
     pub fn new() -> Self {
@@ -26,6 +27,7 @@ impl ShellState {
             queue_visible: state(true),
             primary_size: state(Size::new(1000., 746.)),
             queue_size: state(Size::new(280., 746.)),
+            body_size: state(Size::new(500., 500.)),
         }
     }
 }
@@ -114,8 +116,9 @@ struct MainColumn {
 impl MainColumn {
     fn page(&self, tab: Tab, region: PageRegion) -> AnyView {
         let size = self.app.shell.primary_size.get();
-        let width = (size.width - SIDEBAR_WIDTH).max(500.) + CHROME_MARGIN;
-        let height = size.height;
+        let available = self.app.shell.body_size.get();
+        let width = available.width;
+        let height = available.height;
         let content = if self.app.browser.visible.get() {
             AnyView::new(BrowserFrame {
                 region,
@@ -172,10 +175,15 @@ impl MainColumn {
         if region == PageRegion::Header {
             return content;
         }
-        let player_width = player_width(width - CHROME_MARGIN);
+        let player_width = player_width(width);
+        let body_size = self.app.shell.body_size.clone();
         AnyView::new(Surface::new(
             scarlet_ui::zstack! {
-                main_content(content).repaint_boundary().alignment(Alignment::Top).frame(f32::INFINITY,height),
+                main_content(AnyView::new(content.on_geometry_change(
+                    |g| { let s = g.size(); let i = g.safe_area_insets();
+                        Size::new((s.width-i.left-i.right).max(0.), (s.height-i.top-i.bottom).max(0.)) },
+                    move |s| body_size.set(s),
+                ))).repaint_boundary().alignment(Alignment::Top).frame(f32::INFINITY,size.height),
                 TransportFrame { app: self.app.clone(), width: player_width }.repaint_boundary()
                     .frame(player_width,PLAYER_HEIGHT).padding_insets(EdgeInsets::only_bottom(PLAYER_BOTTOM_MARGIN))
                     .safe_area_padding(SafeAreaEdges::LEFT | SafeAreaEdges::RIGHT),
@@ -189,23 +197,31 @@ impl MainColumn {
         let page = self.clone();
         let select = self.app.clone();
         let heading = self.clone();
-        NavigationLink::new(title, move || page.page(tab, PageRegion::Content))
-            .custom_header(
-                NavigationHeader::new(move || heading.page(tab, PageRegion::Header))
-                    .automatic_height(),
-            )
-            .icon(icon)
-            .on_select(move || {
-                select.collections.return_to_root();
-                if tab == Tab::Sources {
-                    select
-                        .workspace
-                        .source_page
-                        .set(extension::SourcePage::Overview);
-                }
-                select.workspace.tab.set(tab);
-                select.browser.visible.set(false);
+        NavigationLink::new(title, move || NavigationPage {
+            column: page.clone(),
+            tab,
+            region: PageRegion::Content,
+        })
+        .custom_header(
+            NavigationHeader::new(move || NavigationPage {
+                column: heading.clone(),
+                tab,
+                region: PageRegion::Header,
             })
+            .automatic_height(),
+        )
+        .icon(icon)
+        .on_select(move || {
+            select.collections.return_to_root();
+            if tab == Tab::Sources {
+                select
+                    .workspace
+                    .source_page
+                    .set(extension::SourcePage::Overview);
+            }
+            select.workspace.tab.set(tab);
+            select.browser.visible.set(false);
+        })
     }
     fn body(&self) -> AnyView {
         #[cfg(test)]
@@ -222,11 +238,6 @@ impl MainColumn {
             self.link("Effects", Icon::Adjustments, Tab::Effects),
         ))
         .sidebar_width(SIDEBAR_WIDTH)
-        // The canvas reaches the window edge; descendants reserve the full
-        // sidebar width for controls and other meaningful content.
-        .content_underlap(SIDEBAR_WIDTH)
-        .overlay_header(true)
-        .header_leading_overlap(CHROME_MARGIN)
         .shows_icons(true)
         .presentation(NavigationPresentation::Sidebar);
         let index = match self.app.workspace.tab.get() {
@@ -259,6 +270,29 @@ impl View for MainColumn {
         self
     }
 }
+// Geometry changes rebuild only the selected page regions, never the outer
+// navigation. The measured safe size includes live header/player reservations.
+#[derive(Clone)]
+struct NavigationPage {
+    column: MainColumn,
+    tab: Tab,
+    region: PageRegion,
+}
+impl View for NavigationPage {
+    fn create_element(&self) -> Box<dyn Element> {
+        Box::new(scarlet_ui::ComponentElement::new_with_builder(
+            self.clone(),
+            |v| Box::new(v.column.page(v.tab, v.region)),
+        ))
+    }
+    fn listenables(&self) -> Vec<&dyn Listenable> {
+        vec![&self.column.app.shell.body_size]
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[derive(Clone)]
 struct QueueSidebar {
     app: Cadence,

@@ -1432,9 +1432,7 @@ impl LibraryPane {
     fn body(&self) -> AnyView {
         let workspace = &self.app.workspace;
         let width = self.width;
-        let list_height =
-            (self.height - LIBRARY_HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - PLAYER_CLEARANCE)
-                .max(80.);
+        let list_height = (self.height).max(80.);
         let select = workspace.clone();
         let play_app = self.app.clone();
         let columns = library_columns(width - 44.);
@@ -1483,7 +1481,7 @@ impl LibraryPane {
                 },
             ).item_key(|track| track.id.clone().into()).frame(f32::INFINITY, f32::INFINITY))
         };
-        page_with_header_height_in(self.region,
+        page_in(self.region,
             AnyView::new(vstack! {
                 library_header(&self.app, "All songs", format!("{} songs", workspace.filtered.get().len()), workspace.query.clone(), "Search title, artist, or album", width),
                 column_header(hstack! {
@@ -1493,7 +1491,7 @@ impl LibraryPane {
                     catalog_heading("Time", columns[3], true),
                 }.spacing(12.), width),
             }.spacing(0.)),
-            content, self.height, LIBRARY_HEADER_HEIGHT + COLUMN_HEADER_HEIGHT, !workspace.filtered.get().is_empty(),
+            content, self.height, !workspace.filtered.get().is_empty(),
         )
     }
 }
@@ -1565,7 +1563,7 @@ impl SourcesPane {
                 Icon::FolderPlus,
                 "Bring your music together",
                 "Add a source to browse music from a folder, server, or plugin.",
-                self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE,
+                self.height,
             )
         } else {
             AnyView::new(ListView::new(state(rows), state(None), 76., move |_, row, _| {
@@ -1643,7 +1641,7 @@ impl SourcesPane {
                 setup,
                 Text::from_state(workspace.source_status.clone()).font_size(12.).color(ColorPalette::default().text_secondary())
                     .alignment(Alignment::Leading).frame(form_width,36.),
-            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE)),
+            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height)),
             self.height, false)
     }
     fn certificate(&self) -> AnyView {
@@ -1696,7 +1694,7 @@ impl SourcesPane {
                     caption(status_lines[1].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
                     caption(status_lines[2].clone()).alignment(Alignment::Leading).frame(form_width,20.).clip(),
                 }.spacing(0.).frame(form_width,60.),
-            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height - LIBRARY_HEADER_HEIGHT - PLAYER_CLEARANCE)),
+            }.spacing(10.).padding_insets(EdgeInsets::new(CONTENT_PADDING,8.,CONTENT_PADDING,8.)).alignment(Alignment::TopLeading).frame(content_width(width),self.height)),
             self.height, false)
     }
     fn browse(&self) -> AnyView {
@@ -1904,11 +1902,7 @@ impl SourcesPane {
         } else {
             AnyView::new(Spacer::new().frame(0., 0.))
         };
-        let content_height = self.height
-            - LIBRARY_HEADER_HEIGHT
-            - status_height
-            - activity_height
-            - PLAYER_CLEARANCE;
+        let content_height = self.height - status_height - activity_height;
         let entries = if workspace.source_entries.get().is_empty() {
             catalog_empty(
                 Icon::Music,
